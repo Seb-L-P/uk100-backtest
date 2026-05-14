@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+.env.*
+data/cache/
+reports/*.png
+reports/*.csv
+reports/*.md
+.ipynb_checkpoints/
+*.parquet
+.DS_Store
+.pytest_cache/
+*.log

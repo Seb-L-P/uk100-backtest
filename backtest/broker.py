@@ -1,0 +1,397 @@
+"""
+Broker simulator for IG spread bet on UK 100.
+
+Multi-position capable. Existing single-position strategies still work via the
+`broker.position` backward-compat property — it returns the only open position
+or None when there's exactly zero or one. Strategies that want to manage
+multiple positions concurrently use `broker.positions` (a list).
+
+Responsibilities:
+  - Apply spread on entry and exit (cost = spread_points * stake)
+  - Apply slippage on stop fills and market orders
+  - Charge/credit overnight financing on positions held past the daily roll
+  - Validate stake against account leverage cap (sum of notional across positions)
+  - Support partial exits via scale_out()
+  - Optional per-position trailing stop callback that runs each bar in mark()
+
+Spread bet semantics: stake is in £/point. P&L = (exit - entry) * stake * direction.
+Notional exposure for financing = remaining_stake * index_level.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Callable, Literal
+
+from config import COSTS, ACCOUNT, CostModel, AccountConfig
+
+Side = Literal["long", "short"]
+
+
+@dataclass
+class Trade:
+    """A round-trip trade record for the trade log.
+
+    For partial exits, each scale-out creates its own Trade with the
+    portion of stake that was closed. The remainder generates another
+    Trade when it eventually exits.
+    """
+    side: Side
+    stake_per_point: float          # the stake CLOSED in this trade record
+    entry_time: datetime
+    entry_price: float
+    exit_time: datetime
+    exit_price: float
+    gross_pnl_gbp: float
+    spread_cost_gbp: float
+    slippage_cost_gbp: float
+    financing_cost_gbp: float
+    net_pnl_gbp: float
+    bars_held: int
+    exit_reason: str
+    position_id: str = ""           # links partial exits back to their original position
+
+
+@dataclass
+class OpenPosition:
+    """An open position. `remaining_stake_per_point` decreases on partial exits."""
+    id: str
+    side: Side
+    stake_per_point: float                  # original stake at open (immutable)
+    remaining_stake_per_point: float        # decreases on scale_out; 0 → fully closed
+    entry_time: datetime
+    entry_price: float
+    stop_loss: float | None = None
+    take_profit: float | None = None
+    accumulated_financing: float = 0.0      # only counts on remaining stake (proportionally)
+    bars_held: int = 0
+    last_funding_apply: datetime | None = None
+    # Optional: function called each bar to update stop_loss (trailing stop, etc.)
+    # Signature: (position, bar_dict) -> new_stop_loss or None (no change)
+    trailing_stop_fn: Callable | None = None
+
+
+class Broker:
+    """
+    Simulates IG spread bet execution + financing for one or more positions.
+
+    Single-position usage (backward-compatible — most existing strategies):
+        broker.open(side="long", stake_per_point=1.0, time=t, price=p, stop_loss=...)
+        # ... bars pass, broker.mark() and check_stops() called by engine ...
+        broker.close(time=t, price=p, reason="signal")
+
+    Multi-position usage:
+        pos1 = broker.open("long", 1.0, t, p1, stop_loss=...)
+        pos2 = broker.open("long", 0.5, t, p2, stop_loss=..., take_profit=...)
+        broker.scale_out(pos1, time=t, price=p, fraction=0.5, reason="1R")
+        broker.close(pos1, time=t, price=p, reason="trail_hit")
+
+    Costs:
+      Entry: implicit (spread cost recorded on close)
+      Round-trip spread: spread_points * stake (or proportional fraction on partial)
+      Stop fills: + slippage_points * stake
+      Overnight: COSTS.overnight_charge(notional, is_long) per day held
+    """
+
+    def __init__(self, costs: CostModel = COSTS, account: AccountConfig = ACCOUNT):
+        self.costs = costs
+        self.account = account
+        self.balance = account.starting_balance_gbp
+        self.equity_curve: list[tuple[datetime, float]] = []
+        self.trades: list[Trade] = []
+        self.positions: list[OpenPosition] = []
+        self._next_id = 0
+
+    # ---- Backward-compat: single-position view ------------------------
+    @property
+    def position(self) -> OpenPosition | None:
+        """
+        Returns the single open position, or None if zero or multiple.
+        Existing single-position strategies use this; they break gracefully
+        if multi-position is in use (returning None instead of giving them
+        the "wrong" one).
+        """
+        return self.positions[0] if len(self.positions) == 1 else None
+
+    @position.setter
+    def position(self, value):
+        # Allow tests / legacy code to assign None to clear
+        if value is None:
+            self.positions = []
+        else:
+            raise NotImplementedError(
+                "Direct assignment to broker.position is not supported in multi-position mode. "
+                "Use broker.open() and broker.close()."
+            )
+
+    # ---- Position management ------------------------------------------
+    def open(
+        self,
+        side: Side,
+        stake_per_point: float,
+        time: datetime,
+        price: float,
+        stop_loss: float | None = None,
+        take_profit: float | None = None,
+        trailing_stop_fn: Callable | None = None,
+    ) -> OpenPosition:
+        # Validate leverage against TOTAL notional (existing + new)
+        new_notional = stake_per_point * price
+        existing_notional = sum(
+            p.remaining_stake_per_point * p.entry_price for p in self.positions
+        )
+        total = new_notional + existing_notional
+        cap = self.balance * self.account.leverage_cap
+        if total > cap:
+            raise ValueError(
+                f"Total notional £{total:.0f} (existing £{existing_notional:.0f} "
+                f"+ new £{new_notional:.0f}) exceeds {self.account.leverage_cap}x "
+                f"leverage cap on £{self.balance:.0f} (cap £{cap:.0f})"
+            )
+
+        # Enforce account-level concurrent-position cap
+        if len(self.positions) >= self.account.max_concurrent_positions:
+            raise RuntimeError(
+                f"Already at max_concurrent_positions={self.account.max_concurrent_positions}. "
+                f"Increase ACCOUNT.max_concurrent_positions in config.py to allow more."
+            )
+
+        pos = OpenPosition(
+            id=str(self._next_id),
+            side=side,
+            stake_per_point=stake_per_point,
+            remaining_stake_per_point=stake_per_point,
+            entry_time=time,
+            entry_price=price,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            last_funding_apply=time,
+            trailing_stop_fn=trailing_stop_fn,
+        )
+        self._next_id += 1
+        self.positions.append(pos)
+        return pos
+
+    def _resolve(self, position_or_id) -> OpenPosition:
+        """Accept an OpenPosition or its id, return the OpenPosition."""
+        if isinstance(position_or_id, OpenPosition):
+            if position_or_id not in self.positions:
+                raise ValueError(f"Position {position_or_id.id} is not open")
+            return position_or_id
+        if isinstance(position_or_id, str):
+            for p in self.positions:
+                if p.id == position_or_id:
+                    return p
+            raise ValueError(f"No open position with id {position_or_id!r}")
+        raise TypeError(f"Expected OpenPosition or id string, got {type(position_or_id)}")
+
+    def close(
+        self,
+        position_or_time=None,
+        time_or_price=None,
+        price_or_reason=None,
+        reason: str = "signal",
+    ) -> Trade:
+        """
+        Close a position. Supports two calling conventions for backward compat:
+
+        Multi-position:
+            broker.close(position_or_id, time, price, reason="signal")
+
+        Single-position (legacy, when only one position is open):
+            broker.close(time, price, reason="signal")
+        """
+        # Detect which calling convention. If first arg is a datetime or float-like
+        # number that's NOT a position id, it's the legacy single-position style.
+        if isinstance(position_or_time, (OpenPosition, str)) or (
+            position_or_time is not None and isinstance(position_or_time, str)
+        ):
+            # New-style: (position, time, price, reason)
+            position = self._resolve(position_or_time)
+            time = time_or_price
+            price = price_or_reason
+            # reason already from kwarg or default
+        else:
+            # Legacy single-position: (time, price, reason=)
+            if len(self.positions) != 1:
+                raise RuntimeError(
+                    f"Legacy close(time, price) requires exactly one open position; "
+                    f"have {len(self.positions)}. Use close(position, time, price, reason=)."
+                )
+            position = self.positions[0]
+            time = position_or_time
+            price = time_or_price
+            # Third positional arg in legacy signature was reason
+            if isinstance(price_or_reason, str):
+                reason = price_or_reason
+
+        return self._close_full(position, time, price, reason)
+
+    def _close_full(
+        self,
+        position: OpenPosition,
+        time: datetime,
+        price: float,
+        reason: str,
+    ) -> Trade:
+        """Close 100% of the remaining stake on `position`."""
+        return self._close_portion(
+            position, time, price,
+            portion_stake=position.remaining_stake_per_point,
+            reason=reason,
+        )
+
+    def scale_out(
+        self,
+        position_or_id,
+        time: datetime,
+        price: float,
+        fraction: float,
+        reason: str = "scale_out",
+    ) -> Trade:
+        """Close `fraction` (0 < x ≤ 1) of `position`'s remaining stake.
+
+        Records a Trade for the closed portion. If `fraction == 1.0`, fully
+        closes the position (equivalent to `close()`).
+        """
+        if not 0 < fraction <= 1.0:
+            raise ValueError(f"fraction must be in (0, 1], got {fraction}")
+        position = self._resolve(position_or_id)
+        portion = position.remaining_stake_per_point * fraction
+        return self._close_portion(position, time, price, portion, reason)
+
+    def _close_portion(
+        self,
+        position: OpenPosition,
+        time: datetime,
+        price: float,
+        portion_stake: float,
+        reason: str,
+    ) -> Trade:
+        """Close `portion_stake` of `position`. Removes position if fully closed."""
+        if portion_stake <= 0:
+            raise ValueError(f"portion_stake must be positive, got {portion_stake}")
+        if portion_stake > position.remaining_stake_per_point + 1e-9:
+            raise ValueError(
+                f"portion_stake {portion_stake} exceeds remaining "
+                f"{position.remaining_stake_per_point} on position {position.id}"
+            )
+
+        direction = 1 if position.side == "long" else -1
+        gross_pnl = (price - position.entry_price) * direction * portion_stake
+
+        spread_cost = self.costs.spread_points * portion_stake
+        slip_cost = (self.costs.slippage_points * portion_stake
+                     if reason in ("stop", "market") else 0.0)
+
+        # Financing on this portion (proportional to fraction of full position)
+        full_stake = position.stake_per_point
+        portion_fraction_of_original = portion_stake / full_stake if full_stake > 0 else 0.0
+        financing_cost = position.accumulated_financing * portion_fraction_of_original
+
+        net_pnl = gross_pnl - spread_cost - slip_cost - financing_cost
+
+        # Self-check on accounting
+        expected = gross_pnl - spread_cost - slip_cost - financing_cost
+        assert abs(net_pnl - expected) < 1e-9, (
+            f"net_pnl accounting drift on partial close: {net_pnl} != {expected}"
+        )
+
+        trade = Trade(
+            side=position.side,
+            stake_per_point=portion_stake,
+            entry_time=position.entry_time,
+            entry_price=position.entry_price,
+            exit_time=time,
+            exit_price=price,
+            gross_pnl_gbp=gross_pnl,
+            spread_cost_gbp=spread_cost,
+            slippage_cost_gbp=slip_cost,
+            financing_cost_gbp=financing_cost,
+            net_pnl_gbp=net_pnl,
+            bars_held=position.bars_held,
+            exit_reason=reason,
+            position_id=position.id,
+        )
+        self.trades.append(trade)
+        self.balance += net_pnl
+
+        # Update position
+        position.remaining_stake_per_point -= portion_stake
+        position.accumulated_financing -= financing_cost  # remove the portion we just realized
+        if position.remaining_stake_per_point < 1e-9:
+            self.positions.remove(position)
+
+        return trade
+
+    def close_all(self, time: datetime, price: float, reason: str = "close_all") -> list[Trade]:
+        """Close every open position at the given price. Returns list of trades."""
+        return [self._close_full(p, time, price, reason) for p in list(self.positions)]
+
+    # ---- Per-bar updates ----------------------------------------------
+    def mark(self, time: datetime, bar: dict) -> None:
+        """
+        Update equity curve, accrue financing, and run any trailing-stop callbacks.
+
+        `bar` is a dict-like with 'Open', 'High', 'Low', 'Close'.
+        """
+        unrealised = 0.0
+        for pos in self.positions:
+            direction = 1 if pos.side == "long" else -1
+            unrealised += (bar["Close"] - pos.entry_price) * direction * pos.remaining_stake_per_point
+            unrealised -= self.costs.spread_points * pos.remaining_stake_per_point
+            unrealised -= pos.accumulated_financing
+            pos.bars_held += 1
+
+            # Daily financing on remaining stake
+            if pos.last_funding_apply is not None:
+                days_elapsed = (time.date() - pos.last_funding_apply.date()).days
+                if days_elapsed >= 1:
+                    notional = pos.remaining_stake_per_point * bar["Close"]
+                    charge = self.costs.overnight_charge(
+                        notional, is_long=(pos.side == "long"), days=days_elapsed
+                    )
+                    pos.accumulated_financing += charge
+                    pos.last_funding_apply = time
+
+            # Trailing stop callback
+            if pos.trailing_stop_fn is not None:
+                try:
+                    new_stop = pos.trailing_stop_fn(pos, bar)
+                    if new_stop is not None:
+                        # Only ratchet — never widen the stop
+                        if pos.side == "long":
+                            if pos.stop_loss is None or new_stop > pos.stop_loss:
+                                pos.stop_loss = new_stop
+                        else:
+                            if pos.stop_loss is None or new_stop < pos.stop_loss:
+                                pos.stop_loss = new_stop
+                except Exception as e:
+                    # Don't let a bad trailing fn crash the backtest
+                    print(f"[broker] trailing_stop_fn error on position {pos.id}: {e}")
+
+        self.equity_curve.append((time, self.balance + unrealised))
+
+    # ---- Stop/target check --------------------------------------------
+    def check_stops(self, time: datetime, bar: dict) -> list[Trade]:
+        """Check ALL open positions for stop/target hits. Return list of trades closed."""
+        closed: list[Trade] = []
+        for pos in list(self.positions):  # iterate over copy — close may mutate
+            trade = self._check_one_position_stops(pos, time, bar)
+            if trade is not None:
+                closed.append(trade)
+        return closed
+
+    def _check_one_position_stops(self, pos: OpenPosition, time: datetime, bar: dict) -> Trade | None:
+        # Conservative: if both stop and target inside the bar, assume stop first
+        if pos.side == "long":
+            if pos.stop_loss is not None and bar["Low"] <= pos.stop_loss:
+                return self._close_full(pos, time, pos.stop_loss, "stop")
+            if pos.take_profit is not None and bar["High"] >= pos.take_profit:
+                return self._close_full(pos, time, pos.take_profit, "target")
+        else:
+            if pos.stop_loss is not None and bar["High"] >= pos.stop_loss:
+                return self._close_full(pos, time, pos.stop_loss, "stop")
+            if pos.take_profit is not None and bar["Low"] <= pos.take_profit:
+                return self._close_full(pos, time, pos.take_profit, "target")
+        return None
