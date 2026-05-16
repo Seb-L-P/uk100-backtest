@@ -26,7 +26,7 @@ import pandas as pd
 from backtest.broker import Broker
 from backtest.engine import Strategy, Signal
 from backtest.indicators import rsi, atr
-from strategies._helpers import risk_based_stake
+from strategies._helpers import risk_based_stake, atr_threshold
 
 
 class RsiReversion:
@@ -38,7 +38,7 @@ class RsiReversion:
         exit_level: float = 50.0,
         atr_period: int = 14,
         atr_stop_mult: float = 2.0,
-        stop_buffer_pts: float = 1.0,
+        stop_buffer_atr_mult: float = 0.1,
     ):
         self.rsi_period = rsi_period
         self.oversold = oversold
@@ -46,7 +46,7 @@ class RsiReversion:
         self.exit_level = exit_level
         self.atr_period = atr_period
         self.atr_stop_mult = atr_stop_mult
-        self.stop_buffer_pts = stop_buffer_pts
+        self.stop_buffer_atr_mult = stop_buffer_atr_mult
 
     def on_bar(self, history: pd.DataFrame, broker: Broker) -> Signal:
         i = len(history) - 1
@@ -75,10 +75,12 @@ class RsiReversion:
         bar_high = float(bar["High"])
         bar_low = float(bar["Low"])
 
+        stop_buf = atr_threshold(history, self.stop_buffer_atr_mult, self.atr_period)
+
         # Entry: RSI hooked back from extreme
         # Long when RSI was below oversold and is now turning up
         if prev_rsi < self.oversold and cur_rsi > prev_rsi:
-            stop = bar_low - self.atr_stop_mult * atr_now - self.stop_buffer_pts
+            stop = bar_low - self.atr_stop_mult * atr_now - stop_buf
             risk = cur_close - stop
             if risk <= 0:
                 return Signal(action="noop")
@@ -87,7 +89,7 @@ class RsiReversion:
                           stop_loss=stop,
                           reason=f"RSI hook up from {prev_rsi:.1f}")
         if prev_rsi > self.overbought and cur_rsi < prev_rsi:
-            stop = bar_high + self.atr_stop_mult * atr_now + self.stop_buffer_pts
+            stop = bar_high + self.atr_stop_mult * atr_now + stop_buf
             risk = stop - cur_close
             if risk <= 0:
                 return Signal(action="noop")

@@ -14,17 +14,19 @@ import pandas as pd
 from backtest.broker import Broker
 from backtest.engine import Strategy, Signal
 from backtest.indicators import atr
-from strategies._helpers import risk_based_stake
+from strategies._helpers import risk_based_stake, atr_threshold
 
 
 class InsideBarBreakout:
     def __init__(self, atr_period: int = 14, atr_stop_mult: float = 1.5,
-                 r_target: float = 2.0, min_inside_range_pts: float = 3.0,
+                 r_target: float = 2.0, min_inside_range_atr_mult: float = 0.3,
+                 trigger_buffer_atr_mult: float = 0.05,
                  max_age_bars: int = 5):
         self.atr_period = int(atr_period)
         self.atr_stop_mult = atr_stop_mult
         self.r_target = r_target
-        self.min_inside_range_pts = min_inside_range_pts
+        self.min_inside_range_atr_mult = min_inside_range_atr_mult
+        self.trigger_buffer_atr_mult = trigger_buffer_atr_mult
         self.max_age_bars = int(max_age_bars)
 
         self._buy_stop_id: str | None = None
@@ -74,7 +76,8 @@ class InsideBarBreakout:
         if not is_inside:
             return Signal(action="noop")
         inside_range = float(curr["High"]) - float(curr["Low"])
-        if inside_range < self.min_inside_range_pts:
+        min_range = atr_threshold(history, self.min_inside_range_atr_mult, self.atr_period)
+        if inside_range < min_range:
             return Signal(action="noop")
 
         atr_now = float(atr(history, self.atr_period).iloc[-1])
@@ -84,8 +87,9 @@ class InsideBarBreakout:
         stop_pts = self.atr_stop_mult * atr_now
         time = history.index[i]
 
-        buy_trigger = float(curr["High"]) + 0.5
-        sell_trigger = float(curr["Low"]) - 0.5
+        trig_buf = atr_threshold(history, self.trigger_buffer_atr_mult, self.atr_period)
+        buy_trigger = float(curr["High"]) + trig_buf
+        sell_trigger = float(curr["Low"]) - trig_buf
         stake_buy = risk_based_stake(broker.balance, stop_pts, price=buy_trigger)
         stake_sell = risk_based_stake(broker.balance, stop_pts, price=sell_trigger)
 
@@ -121,7 +125,8 @@ class InsideBarBreakout:
             prev = history.iloc[j - 1]
             inside = history.iloc[j]
             if (inside["High"] <= prev["High"] and inside["Low"] >= prev["Low"]
-                    and float(inside["High"]) - float(inside["Low"]) >= self.min_inside_range_pts):
+                    and float(inside["High"]) - float(inside["Low"]) >=
+                        atr_threshold(history, self.min_inside_range_atr_mult, self.atr_period)):
                 cur = history.iloc[-1]
                 if float(cur["Close"]) > float(inside["High"]):
                     return "long"

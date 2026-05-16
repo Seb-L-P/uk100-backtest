@@ -36,10 +36,11 @@ class MtfTrendFvg:
     def __init__(
         self,
         # FVG entry params (same as FvgRetest)
-        min_gap_points: float = 5.0,
-        max_gap_points: float = 50.0,
+        min_gap_atr_mult: float = 0.5,
+        max_gap_atr_mult: float = 5.0,
         max_age_bars: int = 30,
-        stop_buffer_pts: float = 2.0,
+        stop_buffer_atr_mult: float = 0.2,
+        atr_period: int = 14,
         r_target: float = 2.0,
         # MTF trend filter params
         htf_interval: str = "1h",
@@ -49,10 +50,11 @@ class MtfTrendFvg:
         session_close: time = time(15, 0),
         flat_by: time = time(15, 30),
     ):
-        self.min_gap_points = min_gap_points
-        self.max_gap_points = max_gap_points
+        self.min_gap_atr_mult = min_gap_atr_mult
+        self.max_gap_atr_mult = max_gap_atr_mult
         self.max_age_bars = int(max_age_bars)
-        self.stop_buffer_pts = stop_buffer_pts
+        self.stop_buffer_atr_mult = stop_buffer_atr_mult
+        self.atr_period = int(atr_period)
         self.r_target = r_target
         self.htf_interval = htf_interval
         self.htf_ema_period = int(htf_ema_period)
@@ -125,8 +127,12 @@ class MtfTrendFvg:
             in_session = self.session_open <= now <= self.session_close
             is_flat = broker.position is None and not self._fvg_to_order_id
             new_fvg = detect_fvg(history, i)
+            from strategies._helpers import atr_threshold
+            min_gap = atr_threshold(history, self.min_gap_atr_mult, self.atr_period)
+            max_gap = atr_threshold(history, self.max_gap_atr_mult, self.atr_period,
+                                     fallback_pts=1e9)
             if (new_fvg is not None
-                    and self.min_gap_points <= new_fvg.size_points <= self.max_gap_points
+                    and min_gap <= new_fvg.size_points <= max_gap
                     and in_session and is_flat):
                 # The MTF FILTER: only place if HTF trend agrees with FVG direction
                 htf_trend = self._htf_trend(history)
@@ -134,7 +140,7 @@ class MtfTrendFvg:
                 if (htf_trend == "up" and fvg_dir == "bullish") or \
                    (htf_trend == "down" and fvg_dir == "bearish"):
                     self._open_fvgs.append(new_fvg)
-                    self._place_limit_for_fvg(new_fvg, broker, history.index[i])
+                    self._place_limit_for_fvg(new_fvg, broker, history, history.index[i])
 
         # Force-flat at session close
         if now >= self.flat_by:
@@ -146,16 +152,19 @@ class MtfTrendFvg:
 
         return Signal(action="noop")
 
-    def _place_limit_for_fvg(self, fvg: FVG, broker: Broker, time) -> None:
+    def _place_limit_for_fvg(self, fvg: FVG, broker: Broker,
+                             history: pd.DataFrame, time) -> None:
+        from strategies._helpers import atr_threshold
+        stop_buf = atr_threshold(history, self.stop_buffer_atr_mult, self.atr_period)
         if fvg.direction == "bullish":
             entry = fvg.near_edge
-            stop = fvg.far_edge - self.stop_buffer_pts
+            stop = fvg.far_edge - stop_buf
             risk_pts = entry - stop
             target = entry + self.r_target * risk_pts
             side = "long"
         else:
             entry = fvg.near_edge
-            stop = fvg.far_edge + self.stop_buffer_pts
+            stop = fvg.far_edge + stop_buf
             risk_pts = stop - entry
             target = entry - self.r_target * risk_pts
             side = "short"
@@ -196,7 +205,11 @@ class MtfTrendFvg:
             fvg = detect_fvg(history, j)
             if fvg is None:
                 continue
-            if not (self.min_gap_points <= fvg.size_points <= self.max_gap_points):
+            from strategies._helpers import atr_threshold
+            _min_gap = atr_threshold(history, self.min_gap_atr_mult, self.atr_period)
+            _max_gap = atr_threshold(history, self.max_gap_atr_mult, self.atr_period,
+                                       fallback_pts=1e9)
+            if not (_min_gap <= fvg.size_points <= _max_gap):
                 continue
             # Filter by trend alignment
             if htf_trend == "up" and fvg.direction != "bullish":

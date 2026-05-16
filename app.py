@@ -35,7 +35,8 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from data.fetcher import fetch
-from config import COSTS
+import config
+from config import COSTS, PROFILES, profile_for
 from backtest.engine import run_backtest
 from backtest.metrics import compute_metrics
 from backtest.validation import (
@@ -51,7 +52,7 @@ from strategies.ensemble import VoteEnsemble, FilterEnsemble
 
 # ---- Page config -------------------------------------------------------
 st.set_page_config(
-    page_title="UK 100 Backtester",
+    page_title="Backtester",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -125,9 +126,10 @@ with st.sidebar:
         )
         ig_num_points = st.slider(
             "Bars to fetch",
-            min_value=500, max_value=50000, value=5000, step=500,
-            help="EODHD allows up to 100k API calls/day on paid plans; "
-                 "no per-request bar limit issue in practice.",
+            min_value=500, max_value=200000, value=5000, step=500,
+            help="EODHD gives 100k API calls/day — each unique fetch is "
+                 "one call, cached forever after. Effectively unlimited. "
+                 "200k of 15m ≈ 5 years of UK trading.",
         )
     else:
         ticker = st.text_input(
@@ -135,6 +137,27 @@ with st.sidebar:
             help="Yahoo Finance symbol. ^FTSE = FTSE 100 cash index.",
         )
         ig_num_points = 5000  # unused
+    # ---- Cost profile picker -------------------------------------------
+    # Auto-detect a realistic IG retail spread bet cost profile from the
+    # ticker. User can override (e.g. force STOCK profile on a custom ETF).
+    auto_profile = profile_for(ticker)
+    profile_names = list(PROFILES.keys())
+    auto_idx = profile_names.index(auto_profile.instrument) \
+        if auto_profile.instrument in profile_names else profile_names.index("DEFAULT")
+    selected_profile_name = st.selectbox(
+        "Cost profile",
+        profile_names,
+        index=auto_idx,
+        help="Realistic IG retail spread-bet costs per instrument. "
+             "Auto-detected from your ticker; override if needed. "
+             "Indices use fixed-point spreads; stocks/ETFs use bps × price "
+             "so costs scale correctly regardless of price level. "
+             "Real bar-by-bar spreads from IG/EODHD data always win when present.",
+    )
+    # Make the picked profile the active COSTS for this run.
+    config.COSTS = PROFILES[selected_profile_name]
+    active_cost = config.COSTS
+
     interval = st.selectbox("Interval", list(BARS_PER_YEAR.keys()), index=2)
     mode = st.radio(
         "Mode",
@@ -394,7 +417,7 @@ with st.sidebar:
 
 
 # ---- Main area ---------------------------------------------------------
-st.title("UK 100 Backtester")
+st.title("Backtester")
 st.caption(f"**{display_label}** on **{ticker}** at **{interval}** — {mode}")
 if display_desc:
     st.caption(display_desc)
@@ -536,19 +559,36 @@ except Exception as e:
     st.stop()
 
 st.write(f"**Data:** {len(data)} bars from {data.index[0]} to {data.index[-1]}")
+
+# ---- Cost transparency: show what the backtest will actually charge ----
+_last_price = float(data["Close"].iloc[-1])
+_typical_spread = active_cost.effective_spread_pts(price=_last_price)
+_typical_slip = active_cost.effective_slippage_pts(price=_last_price)
+if active_cost.spread_points is not None:
+    _spread_desc = f"**{_typical_spread:.2f}pt** (fixed)"
+else:
+    _spread_desc = (f"**{_typical_spread:.2f}pt** ({active_cost.spread_bps:.1f}bps "
+                    f"× current price {_last_price:.0f})")
 if "Spread" in data.columns:
     spread_series = data["Spread"].dropna()
     if not spread_series.empty:
         st.caption(
-            f"📊 Per-bar spread from IG: avg **{spread_series.mean():.2f}pt**, "
-            f"min {spread_series.min():.2f}pt, max {spread_series.max():.2f}pt, "
-            f"median {spread_series.median():.2f}pt — used per-trade instead of "
-            f"the flat {COSTS.spread_points:.1f}pt config default."
+            f"💰 Cost profile: **{active_cost.instrument}** · "
+            f"Per-bar spread from data: avg {spread_series.mean():.2f}pt, "
+            f"min {spread_series.min():.2f}pt, max {spread_series.max():.2f}pt — "
+            f"used per-trade instead of profile default ({_typical_spread:.2f}pt). "
+            f"Slippage scales with bar spread."
+        )
+    else:
+        st.caption(
+            f"💰 Cost profile: **{active_cost.instrument}** · Spread {_spread_desc}, "
+            f"slippage {_typical_slip:.2f}pt. No bar bid/ask available in data."
         )
 else:
     st.caption(
-        f"📊 Using flat **{COSTS.spread_points:.1f}pt** spread from config "
-        f"(yfinance has no bid/ask data — switch to IG demo for per-bar real spreads)."
+        f"💰 Cost profile: **{active_cost.instrument}** · Spread {_spread_desc}, "
+        f"slippage {_typical_slip:.2f}pt. "
+        f"(For per-bar real spreads, use IG demo data source.)"
     )
 bpy = BARS_PER_YEAR.get(interval, 252)
 
@@ -780,8 +820,69 @@ def trade_inspector_lwc(
     window = data.iloc[start:end]
     overlays = overlays or []
 
-    # ---- Main price chart: candles + markers + price-scale overlays ----
-    series = [{
+    # ---- Position zones (TradingView-style long/short tool) ------------
+    # Two Baseline series drawn BEHIND the candles: the target zone (green,
+    # between entry and the planned take-profit) and the stop zone (red,
+    # between entry and the planned stop-loss). Spans only the trade's
+    # active duration so you can see "this is what the strategy was trying
+    # to do" at a glance.
+    zone_series = []
+    planned_target = trade.get("planned_take_profit")
+    planned_stop = trade.get("planned_stop_loss")
+    entry_ts = int(entry_time.timestamp())
+    exit_ts = int(exit_time.timestamp())
+    # LWC baseline data needs strictly increasing time; entry/exit might be
+    # equal on rare 1-bar trades — nudge by 1s if so.
+    if exit_ts <= entry_ts:
+        exit_ts = entry_ts + 1
+
+    def _zone_series_dict(level: float, color_top1: str, color_top2: str,
+                          color_bot1: str, color_bot2: str,
+                          line_color: str, title: str) -> dict:
+        return {
+            "type": "Baseline",
+            "data": [
+                {"time": entry_ts, "value": float(level)},
+                {"time": exit_ts, "value": float(level)},
+            ],
+            "options": {
+                "baseValue": {"type": "price", "price": float(entry_price)},
+                "topFillColor1": color_top1, "topFillColor2": color_top2,
+                "bottomFillColor1": color_bot1, "bottomFillColor2": color_bot2,
+                "topLineColor": line_color, "bottomLineColor": line_color,
+                "lineWidth": 1,
+                "lineStyle": 2,  # 2 = dashed
+                "lastValueVisible": False,
+                "priceLineVisible": False,
+                "title": title,
+            },
+        }
+
+    if planned_target is not None and not pd.isna(planned_target):
+        # Green box from entry up/down to the planned target.
+        zone_series.append(_zone_series_dict(
+            level=float(planned_target),
+            color_top1="rgba(38, 166, 154, 0.28)",
+            color_top2="rgba(38, 166, 154, 0.04)",
+            color_bot1="rgba(38, 166, 154, 0.28)",
+            color_bot2="rgba(38, 166, 154, 0.04)",
+            line_color="rgba(38, 166, 154, 0.9)",
+            title=f"Target {float(planned_target):.2f}",
+        ))
+    if planned_stop is not None and not pd.isna(planned_stop):
+        # Red box from entry to the planned stop.
+        zone_series.append(_zone_series_dict(
+            level=float(planned_stop),
+            color_top1="rgba(239, 83, 80, 0.28)",
+            color_top2="rgba(239, 83, 80, 0.04)",
+            color_bot1="rgba(239, 83, 80, 0.28)",
+            color_bot2="rgba(239, 83, 80, 0.04)",
+            line_color="rgba(239, 83, 80, 0.9)",
+            title=f"Stop {float(planned_stop):.2f}",
+        ))
+
+    # ---- Main price chart: zones BEHIND candles, then markers + overlays
+    candle_series = {
         "type": "Candlestick",
         "data": _df_to_lwc_candles(window),
         "options": {
@@ -789,9 +890,9 @@ def trade_inspector_lwc(
             "borderVisible": False,
             "wickUpColor": "#26a69a", "wickDownColor": "#ef5350",
         },
-    }]
+    }
     win_color = "#26a69a" if pnl > 0 else "#ef5350"
-    series[0]["markers"] = [
+    candle_series["markers"] = [
         {"time": int(entry_time.timestamp()),
          "position": "belowBar" if side == "long" else "aboveBar",
          "color": "#2196f3",
@@ -802,6 +903,7 @@ def trade_inspector_lwc(
          "color": win_color, "shape": "circle",
          "text": f"Exit £{pnl:+.2f}"},
     ]
+    series = zone_series + [candle_series]
 
     # Price-scale overlays computed on full data, sliced to the window
     win_start, win_end = window.index[0], window.index[-1]
@@ -881,6 +983,124 @@ def metrics_panel(m, label: str = "Headline") -> None:
         st.write(f"- Financing: -£{m.total_financing_cost:,.2f}")
 
 
+def cost_audit_panel(result, last_price: float, profile) -> None:
+    """
+    Auditable, hand-verifiable cost diagnostics. Shows the active profile
+    in plain English, the realised cost distribution across trades, and a
+    worked example so the user can recompute any trade by hand.
+
+    This is here because backtest results are only believable to the extent
+    that you trust the cost model. Make it inspectable.
+    """
+    with st.expander("🔍 Cost audit — verify the model"):
+        # ---- Profile in plain English ---------------------------------
+        st.markdown("**Active cost profile**")
+        if profile.spread_points is not None:
+            spread_desc = (f"`{profile.spread_points} pt` (fixed per-trade, "
+                           f"typical for index spread bets where IG quotes "
+                           f"a stable absolute spread regardless of price level)")
+        else:
+            eff = profile.effective_spread_pts(price=last_price)
+            spread_desc = (f"`{profile.spread_bps} bps` × current price → "
+                           f"≈`{eff:.3f} pt` at the latest close ({last_price:.2f}). "
+                           f"Scales with price level — same friction on a £200 "
+                           f"stock as on a £20 000 index.")
+        st.write(f"- **Instrument:** `{profile.instrument}`")
+        st.write(f"- **Spread (round-trip):** {spread_desc}")
+
+        if profile.slippage_points is not None:
+            slip_desc = f"`{profile.slippage_points} pt` (fixed)"
+        else:
+            eff_slip = profile.effective_slippage_pts(price=last_price)
+            slip_desc = f"`{profile.slippage_bps} bps` × price → ≈`{eff_slip:.3f} pt` at latest close"
+        st.write(f"- **Slippage** (stops + market orders only): {slip_desc}, "
+                 f"floor `{profile.min_slippage_points} pt`")
+        st.write(f"- **Variable slippage** when real bar spread known: "
+                 f"`{profile.slip_spread_multiplier}× bar_spread`")
+        st.write(f"- **Long financing** (annualised): "
+                 f"`{profile.long_funding_annual*100:.2f}%` of notional, charged daily")
+        st.write(f"- **Short financing** (annualised, can be credit): "
+                 f"`{profile.short_funding_annual*100:.2f}%`")
+
+        st.markdown("---")
+
+        # ---- Realised cost distribution from the actual trades --------
+        df = result.trades_df
+        if df.empty:
+            st.info("No trades to audit.")
+            return
+        sp = df["spread_cost_gbp"]
+        sl = df["slippage_cost_gbp"]
+        st.markdown("**Realised per-trade costs (from this backtest)**")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Spread / trade (avg)", f"£{sp.mean():.2f}",
+                  delta=f"median £{sp.median():.2f}")
+        c2.metric("Slippage / trade (avg)", f"£{sl.mean():.2f}",
+                  delta=f"median £{sl.median():.2f}")
+        c3.metric("Total friction / trade", f"£{(sp+sl).mean():.2f}",
+                  delta=f"max £{(sp+sl).max():.2f}")
+
+        # ---- Worked example: recompute the first trade by hand --------
+        st.markdown("**Hand-verifiable example — recompute the first trade**")
+        t0 = df.iloc[0]
+        entry = float(t0["entry_price"])
+        stake = float(t0["stake_per_point"])
+        actual_spread = float(t0["spread_cost_gbp"])
+        actual_slip = float(t0["slippage_cost_gbp"])
+        exit_reason = t0.get("exit_reason", "?")
+
+        st.code(
+            f"# Trade 0\n"
+            f"entry_price   = {entry:.4f}\n"
+            f"stake_per_pt  = {stake:.4f} £/pt\n"
+            f"exit_reason   = {exit_reason!r}\n"
+            f"\n"
+            f"# Profile predicts:\n"
+            f"expected_spread_pt   = {profile.effective_spread_pts(price=entry):.4f} pt\n"
+            f"expected_spread_£    = spread_pt × stake = "
+            f"{profile.effective_spread_pts(price=entry) * stake:.4f}\n"
+            f"\n"
+            f"# Backtester recorded:\n"
+            f"actual_spread_£      = {actual_spread:.4f}\n"
+            f"actual_slippage_£    = {actual_slip:.4f}",
+            language="python",
+        )
+        # Sanity check: the recorded should match the prediction within rounding
+        # (off by at most slippage if it's a stop/market trade, since slippage
+        # is recorded separately).
+        predicted = profile.effective_spread_pts(price=entry) * stake
+        ratio = (actual_spread / predicted) if predicted > 0 else 0
+        if 0.5 <= ratio <= 2.0 or abs(actual_spread - predicted) < 0.5:
+            st.success(
+                f"✅ Spread matches prediction within rounding "
+                f"(actual £{actual_spread:.2f} vs predicted £{predicted:.2f})."
+            )
+        else:
+            st.warning(
+                f"⚠️ Spread differs from prediction by {(ratio-1)*100:+.0f}%. "
+                f"Likely cause: data has a per-bar `Spread` column overriding the "
+                f"profile, or the trade used a different stake than expected. "
+                f"Check `result.trades_df.iloc[0]` to confirm."
+            )
+
+        # ---- How to double-check externally ----------------------------
+        st.markdown("**How to sanity-check this backtester**")
+        st.markdown(
+            "1. **Compare to broker statements.** Pull an actual IG/CFD trade "
+            "ticket. Spread cost on the ticket should match the profile within ~10%.\n"
+            "2. **Run a zero-edge strategy.** Open and immediately close at the same "
+            "price (use the `sma` strategy with `fast=1, slow=2` for noise-driven "
+            "flips). Net P&L per trade should ≈ −spread×stake. If it does, the "
+            "cost model is sound; the strategy edge (or lack thereof) is what's left.\n"
+            "3. **Verify the accounting identity.** The engine asserts "
+            "`starting_balance + sum(net_pnl) == final_balance` at every run end. "
+            "If that fires, there's a bug — file an issue.\n"
+            "4. **Compare to FREE_LUNCH benchmark.** Run a 1R-target / 1R-stop "
+            "random-entry strategy on the same data. Long-run net P&L per trade "
+            "should be ≈ −(spread + slippage) × stake regardless of direction."
+        )
+
+
 # ---- Run ---------------------------------------------------------------
 if mode == "Single backtest":
     # Cached path: if we already ran this exact config, reuse the result so
@@ -889,9 +1109,18 @@ if mode == "Single backtest":
     if st.session_state.get("single_result") is not None:
         result, m = st.session_state["single_result"]
     else:
-        with st.spinner("Running backtest..."):
-            result = run_backtest(data, strategy_factory(), warmup_bars=warmup_bars)
-            m = compute_metrics(result, bars_per_year=bpy)
+        progress_slot = st.empty()
+        bar = progress_slot.progress(0, text=f"Running backtest over {len(data):,} bars…")
+        def _update_progress(frac: float):
+            pct = int(frac * 100)
+            bar.progress(min(pct, 99),
+                         text=f"Running backtest… {pct}% ({len(data):,} bars)")
+        result = run_backtest(data, strategy_factory(),
+                              warmup_bars=warmup_bars,
+                              progress_callback=_update_progress)
+        bar.progress(100, text=f"Computing metrics… ({len(result.trades_df)} trades)")
+        m = compute_metrics(result, bars_per_year=bpy)
+        progress_slot.empty()
         st.session_state["single_result"] = (result, m)
 
         # Auto-save to run history (only on the FRESH compute path,
@@ -911,6 +1140,8 @@ if mode == "Single backtest":
             st.caption(f"⚠️ Run not saved to history: {e}")
 
     metrics_panel(m, label="Results")
+    cost_audit_panel(result, last_price=float(data["Close"].iloc[-1]),
+                     profile=active_cost)
     st.plotly_chart(
         equity_chart(result.equity_curve, price=data["Close"],
                      trades_df=result.trades_df, title=f"{display_label} — equity & trades"),
@@ -1037,6 +1268,14 @@ if mode == "Single backtest":
             st.write(f"Side: **{picked_trade['side']}**")
             st.write(f"Entry: £{picked_trade['entry_price']:.2f}")
             st.write(f"Exit: £{picked_trade['exit_price']:.2f}")
+            # Show planned levels when present, so the on-chart green/red
+            # boxes have explicit numbers alongside them.
+            _pt = picked_trade.get("planned_take_profit")
+            _ps = picked_trade.get("planned_stop_loss")
+            if _pt is not None and not pd.isna(_pt):
+                st.write(f"Target: £{float(_pt):.2f}")
+            if _ps is not None and not pd.isna(_ps):
+                st.write(f"Stop: £{float(_ps):.2f}")
             st.write(f"Stake: £{picked_trade['stake_per_point']:.2f}/pt")
             st.write(f"Bars held: {picked_trade['bars_held']}")
             st.write(f"Exit: {picked_trade['exit_reason']}")

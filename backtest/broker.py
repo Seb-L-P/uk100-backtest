@@ -7,7 +7,7 @@ or None when there's exactly zero or one. Strategies that want to manage
 multiple positions concurrently use `broker.positions` (a list).
 
 Responsibilities:
-  - Apply spread on entry and exit (cost = spread_points * stake)
+  - Apply spread on entry and exit (cost = effective_spread_pts(price) * stake)
   - Apply slippage on stop fills and market orders
   - Charge/credit overnight financing on positions held past the daily roll
   - Validate stake against account leverage cap (sum of notional across positions)
@@ -80,6 +80,11 @@ class Trade:
     bars_held: int
     exit_reason: str
     position_id: str = ""           # links partial exits back to their original position
+    # Original SL/TP set at entry. Preserved across trailing-stop adjustments
+    # so the trade inspector can visualise what the strategy WAS AIMING FOR.
+    # None if the strategy didn't specify one.
+    planned_stop_loss: float | None = None
+    planned_take_profit: float | None = None
 
 
 @dataclass
@@ -93,6 +98,11 @@ class OpenPosition:
     entry_price: float
     stop_loss: float | None = None
     take_profit: float | None = None
+    # Snapshots of SL/TP at entry. Preserved even when `stop_loss` is moved
+    # by trailing logic — used by the inspector to draw "what the strategy
+    # was originally aiming for" boxes.
+    initial_stop_loss: float | None = None
+    initial_take_profit: float | None = None
     accumulated_financing: float = 0.0      # only counts on remaining stake (proportionally)
     bars_held: int = 0
     last_funding_apply: datetime | None = None
@@ -101,7 +111,7 @@ class OpenPosition:
     trailing_stop_fn: Callable | None = None
     # The bid/ask spread observed on the bar this position was opened on.
     # When set, used (combined with the exit bar's spread) to compute the
-    # round-trip spread cost. None → falls back to config.spread_points.
+    # round-trip spread cost. None → falls back to the active cost profile.
     entry_spread_pts: float | None = None
 
 
@@ -122,12 +132,19 @@ class Broker:
 
     Costs:
       Entry: implicit (spread cost recorded on close)
-      Round-trip spread: spread_points * stake (or proportional fraction on partial)
+      Round-trip spread: effective_spread_pts(price) * stake (or proportional fraction on partial)
       Stop fills: + slippage_points * stake
       Overnight: COSTS.overnight_charge(notional, is_long) per day held
     """
 
-    def __init__(self, costs: CostModel = COSTS, account: AccountConfig = ACCOUNT):
+    def __init__(self, costs: CostModel | None = None,
+                 account: AccountConfig = ACCOUNT):
+        # Look up COSTS dynamically (not at function-def time) so callers can
+        # set the cost profile globally via `config.COSTS = profile_for(...)`
+        # without having to plumb it through every wrapper.
+        if costs is None:
+            import config as _config
+            costs = _config.COSTS
         self.costs = costs
         self.account = account
         self.balance = account.starting_balance_gbp
@@ -205,6 +222,8 @@ class Broker:
             entry_price=price,
             stop_loss=stop_loss,
             take_profit=take_profit,
+            initial_stop_loss=stop_loss,        # immutable snapshot
+            initial_take_profit=take_profit,
             last_funding_apply=time,
             trailing_stop_fn=trailing_stop_fn,
             entry_spread_pts=entry_spread_pts,
@@ -303,13 +322,16 @@ class Broker:
         self,
         position: OpenPosition,
         exit_spread_pts: float | None,
+        exit_price: float | None = None,
     ) -> float:
         """
         Determine the spread (in points) to charge for this round-trip.
 
         - If both entry and exit spreads are known (IG data), use the average
         - If only one is known, use that one
-        - If neither is known (yfinance data), fall back to config.spread_points
+        - Else fall back to the cost profile's effective_spread_pts(price),
+          which is points-based for major indices and bps × price for stocks/
+          ETFs / unknown instruments.
         """
         if position.entry_spread_pts is not None and exit_spread_pts is not None:
             return (position.entry_spread_pts + exit_spread_pts) / 2.0
@@ -317,7 +339,8 @@ class Broker:
             return position.entry_spread_pts
         if exit_spread_pts is not None:
             return exit_spread_pts
-        return self.costs.spread_points
+        # Profile fallback — uses exit_price for bps-based instruments
+        return self.costs.effective_spread_pts(price=exit_price)
 
     def _close_portion(
         self,
@@ -340,13 +363,16 @@ class Broker:
         direction = 1 if position.side == "long" else -1
         gross_pnl = (price - position.entry_price) * direction * portion_stake
 
-        # Per-trade spread (uses bar-specific bid/ask if IG data, else config flat)
-        spread_pts = self._effective_spread_pts(position, exit_spread_pts)
+        # Per-trade spread — prefer real bar bid/ask, else profile (points or
+        # bps × price depending on instrument).
+        spread_pts = self._effective_spread_pts(position, exit_spread_pts,
+                                                 exit_price=price)
         spread_cost = spread_pts * portion_stake
         # Variable slippage: scales with the current bar's spread (when known),
         # so stops slip more during volatile/news bars and less in calm conditions.
         if reason in ("stop", "market"):
-            slip_pts = self.costs.effective_slippage_pts(exit_spread_pts)
+            slip_pts = self.costs.effective_slippage_pts(exit_spread_pts,
+                                                          price=price)
             slip_cost = slip_pts * portion_stake
         else:
             slip_cost = 0.0
@@ -379,6 +405,8 @@ class Broker:
             bars_held=position.bars_held,
             exit_reason=reason,
             position_id=position.id,
+            planned_stop_loss=position.initial_stop_loss,
+            planned_take_profit=position.initial_take_profit,
         )
         self.trades.append(trade)
         self.balance += net_pnl
@@ -506,8 +534,10 @@ class Broker:
         elif order.order_type == "stop":
             # Stop buy: fill if price rises through trigger (worse fill via slippage).
             # Stop sell: fill if price falls through trigger.
-            # Slippage scales with the current bar's spread when known.
-            slip = self.costs.effective_slippage_pts(bar_spread)
+            # Slippage scales with the current bar's spread when known, else
+            # uses the cost profile (bps × price for bps-based instruments).
+            slip = self.costs.effective_slippage_pts(bar_spread,
+                                                     price=order.trigger_price)
             if order.side == "long" and high >= order.trigger_price:
                 return True, order.trigger_price + slip
             if order.side == "short" and low <= order.trigger_price:
@@ -525,7 +555,10 @@ class Broker:
         for pos in self.positions:
             direction = 1 if pos.side == "long" else -1
             unrealised += (bar["Close"] - pos.entry_price) * direction * pos.remaining_stake_per_point
-            unrealised -= self.costs.spread_points * pos.remaining_stake_per_point
+            # Subtract expected close-out spread cost from unrealised equity,
+            # so the equity curve reflects what we'd actually walk away with.
+            spread_pts = self.costs.effective_spread_pts(price=bar["Close"])
+            unrealised -= spread_pts * pos.remaining_stake_per_point
             unrealised -= pos.accumulated_financing
             pos.bars_held += 1
 

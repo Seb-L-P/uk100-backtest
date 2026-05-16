@@ -112,6 +112,8 @@ def run_backtest(
     strategy: Strategy,
     warmup_bars: int = 50,
     verbose: bool = False,
+    costs=None,
+    progress_callback=None,
 ) -> BacktestResult:
     """
     Run a backtest of `strategy` on `data`.
@@ -120,13 +122,25 @@ def run_backtest(
     by datetime, sorted ascending. `warmup_bars` is how many bars to give the
     strategy before allowing signals (so e.g. SMAs are populated).
 
+    `costs` is an optional CostModel (per-instrument profile). If None, uses
+    config.COSTS (UK100 default). Pass `config.profile_for(ticker)` to get a
+    realistic profile for any instrument.
+
+    `progress_callback` (optional): a callable taking `(fraction: float)` in
+    [0, 1] called periodically as the backtest progresses. Use this to drive
+    a progress bar in the UI. For performance, it's only invoked at coarse
+    intervals (~1% of bars), not every bar.
+
     Execution model:
       1. At bar i, broker.mark() updates equity using bar[i]'s close.
       2. broker.check_stops() may close the position if stops/targets are hit.
       3. Strategy sees history[0..i] and may return a signal.
       4. Signal acts on bar[i+1]'s OPEN (no same-bar execution).
     """
-    broker = Broker()
+    if costs is None:
+        from config import COSTS as _DEFAULT_COSTS
+        costs = _DEFAULT_COSTS
+    broker = Broker(costs=costs)
     n = len(data)
 
     # Track pending signals to execute at next bar's open
@@ -134,7 +148,17 @@ def run_backtest(
 
     has_spread_col = "Spread" in data.columns
 
+    # Progress callback: only fire ~100 times max regardless of bar count,
+    # so the UI isn't drowned in updates on multi-million-bar runs.
+    progress_step = max(1, n // 100)
+
     for i in range(n):
+        if progress_callback is not None and (i % progress_step == 0 or i == n - 1):
+            try:
+                progress_callback(i / max(n - 1, 1))
+            except Exception:
+                # A failing callback should never break a backtest.
+                pass
         time = data.index[i]
         bar = data.iloc[i]
         bar_dict = {
@@ -143,8 +167,8 @@ def run_backtest(
             "Low": float(bar["Low"]),
             "Close": float(bar["Close"]),
         }
-        # Per-bar spread (IG data has it; yfinance doesn't — engine then
-        # falls back to config.spread_points inside the broker).
+        # Per-bar spread (IG data has it; yfinance doesn't — broker then
+        # falls back to the active cost profile, bps-scaled if needed).
         if has_spread_col:
             spread_val = float(bar["Spread"])
             if not pd.isna(spread_val):
@@ -237,7 +261,7 @@ def _apply_signal(signal: Signal, broker: Broker, time, price: float,
 
     `entry_spread_pts`: bid/ask spread observed on the bar where the fill happens
     (extracted by engine from data["Spread"] when present). Used by broker to
-    record per-trade spread cost; if None, broker falls back to config.spread_points.
+    record per-trade spread cost; if None, broker falls back to the active cost profile.
 
     Multi-position aware. For backward compat with single-position strategies,
     open_long/open_short with replace_all=True (the default) closes any
@@ -333,4 +357,8 @@ def _trade_to_dict(t) -> dict:
         "net_pnl_gbp": round(t.net_pnl_gbp, 2),
         "bars_held": t.bars_held,
         "exit_reason": t.exit_reason,
+        # Planned levels at entry (None for strategies without explicit SL/TP).
+        # Used by the trade inspector to draw target/stop zones.
+        "planned_stop_loss": t.planned_stop_loss,
+        "planned_take_profit": t.planned_take_profit,
     }

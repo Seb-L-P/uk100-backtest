@@ -32,20 +32,23 @@ from backtest.indicators import detect_fvg, FVG
 class FvgRetest:
     def __init__(
         self,
-        min_gap_points: float = 5.0,
-        max_gap_points: float = 50.0,
+        min_gap_atr_mult: float = 0.5,
+        max_gap_atr_mult: float = 5.0,
         max_age_bars: int = 30,
-        stop_buffer_pts: float = 2.0,
+        stop_buffer_atr_mult: float = 0.2,
+        atr_period: int = 14,
         r_target: float = 2.0,
         session_open: time = time(9, 0),
         session_close: time = time(15, 0),
         flat_by: time = time(15, 30),
     ):
-        self.min_gap_points = min_gap_points
-        self.max_gap_points = max_gap_points
-        # Cast int-typed params defensively (sweep round-trip can convert to float)
+        # Thresholds expressed as ATR multiples — scale-invariant across
+        # instruments (FTSE, AAPL, BTC) and volatility regimes.
+        self.min_gap_atr_mult = min_gap_atr_mult
+        self.max_gap_atr_mult = max_gap_atr_mult
         self.max_age_bars = int(max_age_bars)
-        self.stop_buffer_pts = stop_buffer_pts
+        self.stop_buffer_atr_mult = stop_buffer_atr_mult
+        self.atr_period = int(atr_period)
         self.r_target = r_target
         self.session_open = session_open
         self.session_close = session_close
@@ -103,11 +106,17 @@ class FvgRetest:
             in_session = self.session_open <= now <= self.session_close
             is_flat = (broker.position is None and not self._fvg_to_order_id)
             new_fvg = detect_fvg(history, i)
+            # Scale gap-size thresholds by current ATR
+            from strategies._helpers import atr_threshold
+            min_gap = atr_threshold(history, self.min_gap_atr_mult, self.atr_period)
+            max_gap = atr_threshold(history, self.max_gap_atr_mult, self.atr_period,
+                                     fallback_pts=1e9)
             if (new_fvg is not None
-                    and self.min_gap_points <= new_fvg.size_points <= self.max_gap_points
+                    and min_gap <= new_fvg.size_points <= max_gap
                     and in_session and is_flat):
                 self._open_fvgs.append(new_fvg)
-                self._place_limit_for_fvg(new_fvg, broker, history.index[i])
+                self._place_limit_for_fvg(new_fvg, broker, history.index[i],
+                                          history=history)
 
         # ---- 4. Force-flat at end of session ------------------------------
         if now >= self.flat_by:
@@ -128,11 +137,17 @@ class FvgRetest:
         most-recent such FVG. Ignores limit-order semantics — ensembles take
         market-priced entries based on intent.
         """
+        from strategies._helpers import atr_threshold
         i = len(history) - 1
         if i < 2:
             return "none"
         bar = history.iloc[i]
         bar_low, bar_high = float(bar["Low"]), float(bar["High"])
+
+        # ATR-scaled gap thresholds (computed once per call)
+        min_gap = atr_threshold(history, self.min_gap_atr_mult, self.atr_period)
+        max_gap = atr_threshold(history, self.max_gap_atr_mult, self.atr_period,
+                                 fallback_pts=1e9)
 
         best: FVG | None = None
         # Walk back up to max_age_bars and check each candidate FVG.
@@ -140,7 +155,7 @@ class FvgRetest:
             fvg = detect_fvg(history, j)
             if fvg is None:
                 continue
-            if not (self.min_gap_points <= fvg.size_points <= self.max_gap_points):
+            if not (min_gap <= fvg.size_points <= max_gap):
                 continue
             # Has the FVG already been fully filled by intermediate bars?
             after = history.iloc[fvg.creator_bar_index + 1: i + 1]
@@ -160,19 +175,27 @@ class FvgRetest:
             return "none"
         return "long" if best.direction == "bullish" else "short"
 
-    def _place_limit_for_fvg(self, fvg: FVG, broker: Broker, time) -> None:
+    def _place_limit_for_fvg(self, fvg: FVG, broker: Broker, time,
+                              history: pd.DataFrame | None = None) -> None:
         """Compute entry/stop/target for the FVG and place the limit order."""
-        from strategies._helpers import risk_based_stake
+        from strategies._helpers import risk_based_stake, atr_threshold
+
+        # ATR-scaled stop buffer
+        if history is not None:
+            stop_buffer = atr_threshold(history, self.stop_buffer_atr_mult,
+                                         self.atr_period, fallback_pts=0.5)
+        else:
+            stop_buffer = 0.5
 
         if fvg.direction == "bullish":
-            entry = fvg.near_edge                        # zone_high
-            stop = fvg.far_edge - self.stop_buffer_pts   # below zone_low
+            entry = fvg.near_edge                       # zone_high
+            stop = fvg.far_edge - stop_buffer           # below zone_low
             risk_pts = entry - stop
             target = entry + self.r_target * risk_pts
             side = "long"
         else:
-            entry = fvg.near_edge                        # zone_low
-            stop = fvg.far_edge + self.stop_buffer_pts   # above zone_high
+            entry = fvg.near_edge                       # zone_low
+            stop = fvg.far_edge + stop_buffer           # above zone_high
             risk_pts = stop - entry
             target = entry - self.r_target * risk_pts
             side = "short"

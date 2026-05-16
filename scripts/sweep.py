@@ -5,12 +5,12 @@ Two-step workflow:
 
   STEP 1 — sweep on in-sample (lots of combinations OK):
       python scripts/sweep.py --strategy fvg --interval 1h \\
-          --params "min_gap_points=3,5,7,10;r_target=1.5,2.0,2.5,3.0"
+          --params "min_gap_atr_mult=0.3,0.5,0.7,1.0;r_target=1.5,2.0,2.5,3.0"
 
   STEP 2 — pick ONE param set from the table you got back, then evaluate
   on out-of-sample (single combination, ONCE):
       python scripts/sweep.py --strategy fvg --interval 1h \\
-          --params "min_gap_points=5;r_target=2.0" --evaluate-oos
+          --params "min_gap_atr_mult=0.5;r_target=2.0" --evaluate-oos
 
 The --evaluate-oos flag enforces a single value per param so you can't
 accidentally turn the OOS check into another sweep.

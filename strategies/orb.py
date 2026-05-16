@@ -8,7 +8,7 @@ Rules:
   2. After the opening range is set, wait for price to break above the high
      (go LONG) or below the low (go SHORT).
   3. Stop: on the OTHER side of the opening range (long stops at OR low,
-     short stops at OR high), with a small `stop_buffer_pts` cushion.
+     short stops at OR high), with an ATR-relative cushion (`stop_buffer_atr_mult`).
   4. Target: `r_target` × risk distance.
   5. One trade max per day (don't keep retrying after a stop-out).
   6. Flat by `flat_by` time regardless.
@@ -39,14 +39,16 @@ class OpeningRangeBreakout:
         self,
         opening_range_bars: int = 2,        # 2 bars on 15m = first 30 min
         r_target: float = 1.5,
-        stop_buffer_pts: float = 2.0,
+        stop_buffer_atr_mult: float = 0.2,
+        atr_period: int = 14,
         session_open: time = time(8, 0),    # FTSE 100 cash open
         session_close: time = time(15, 30), # latest entry
         flat_by: time = time(16, 0),
     ):
-        self.opening_range_bars = opening_range_bars
+        self.opening_range_bars = int(opening_range_bars)
         self.r_target = r_target
-        self.stop_buffer_pts = stop_buffer_pts
+        self.stop_buffer_atr_mult = stop_buffer_atr_mult
+        self.atr_period = int(atr_period)
         self.session_open = session_open
         self.session_close = session_close
         self.flat_by = flat_by
@@ -102,11 +104,13 @@ class OpeningRangeBreakout:
         if self._or_high is None or self._or_low is None:
             return Signal(action="noop")
 
+        from strategies._helpers import atr_threshold
+        stop_buffer = atr_threshold(history, self.stop_buffer_atr_mult, self.atr_period)
         close = float(bar["Close"])
         if close > self._or_high:
             # Bullish breakout
             entry = close
-            stop = self._or_low - self.stop_buffer_pts
+            stop = self._or_low - stop_buffer
             risk = entry - stop
             target = entry + self.r_target * risk
             stake = risk_based_stake(broker.balance, risk, price=entry)
@@ -116,7 +120,7 @@ class OpeningRangeBreakout:
                           reason=f"ORB up: OR={self._or_low:.1f}-{self._or_high:.1f}")
         if close < self._or_low:
             entry = close
-            stop = self._or_high + self.stop_buffer_pts
+            stop = self._or_high + stop_buffer
             risk = stop - entry
             target = entry - self.r_target * risk
             stake = risk_based_stake(broker.balance, risk, price=entry)

@@ -61,6 +61,29 @@ def risk_based_stake(equity_gbp: float, risk_pts: float,
     return stake
 
 
+def atr_threshold(history: pd.DataFrame, atr_mult: float,
+                  atr_period: int = 14, fallback_pts: float = 1.0) -> float:
+    """
+    Convert an ATR-multiplier threshold to absolute points using the bar's
+    current ATR. Used by strategies that want SCALE-INVARIANT thresholds
+    (works the same on FTSE 10k, AAPL 200, BTC 60k, regardless of price).
+
+    Example:
+        min_gap = atr_threshold(history, atr_mult=0.5)  # half an ATR
+    On FTSE with ATR=10pt → min_gap=5pt. On AAPL with ATR=2pt → min_gap=1pt.
+    Same VOLATILITY-RELATIVE threshold; auto-adapts to instrument.
+
+    Returns `fallback_pts` if ATR is unavailable (early in series).
+    """
+    from backtest.indicators import atr as _atr_fn
+    if len(history) < atr_period + 2:
+        return fallback_pts
+    a = _atr_fn(history, atr_period).iloc[-1]
+    if pd.isna(a) or a <= 0:
+        return fallback_pts
+    return atr_mult * float(a)
+
+
 def in_session(now: _time, session_open: _time, session_close: _time) -> bool:
     """True if `now` falls in the [open, close] window inclusive."""
     return session_open <= now <= session_close

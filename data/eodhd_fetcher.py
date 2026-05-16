@@ -14,8 +14,12 @@ Caveats:
     sometimes discounted via SAVEONTRADING) unlocks FTSE 100.
   - EODHD's native intraday intervals are 1m, 5m, 1h. We resample 5m → 15m
     and 5m → 30m client-side if those are requested.
+  - EODHD enforces a 600-day-per-request limit on intraday data. We chunk
+    requests transparently — a 30-year intraday fetch becomes ~18 sequential
+    API calls, each counting against your 100k/day allowance (so essentially
+    unlimited for normal use).
   - No bid/ask spread data on indices — `Spread` column NOT emitted, so the
-    backtester falls back to the flat 1.5pt cost-model default.
+    backtester falls back to the active cost profile.
 
 Credentials are loaded from .env. Required: `EODHD_API_KEY=...`.
 Optional: `EODHD_FTSE_SYMBOL=FTSE.INDX` if the default doesn't work for you.
@@ -109,19 +113,23 @@ def _intraday_range(interval: str, num_points: int) -> tuple[int, int]:
     Compute (from_ts, to_ts) for an intraday fetch, given the desired number
     of bars at the resolution. Returns UNIX seconds.
 
-    The from-side is conservative — we ask for MUCH more wall-clock time
-    than strictly needed because:
-      - weekends + holidays mean ~30% fewer trading days
-      - UK market is open ~8.5h/day (08:00-16:30) — only 35% of clock time
-      - the script might run on a weekend, in which case "the last N hours"
-        contains no trading data at all
-    Empirical safety factor: 6x is safe even for 1m bars over weekends.
-    Minimum 7 days back to always include at least one trading session.
+    Notes:
+      - Liquid intraday markets trade ~6.5-8h/day, ~252 days/year, so calendar
+        time is ~5x longer than trading time. We use 5x as the safety factor.
+      - The chunked fetcher walks back in 599-day windows and stops early when
+        EODHD returns no data (i.e. we've gone past the asset's history start).
+        So overshooting `from_ts` is harmless.
+      - Capped at 30 years which is EODHD's maximum coverage for most assets.
     """
     to_ts = int(dt.datetime.now().timestamp())
     minutes_per_bar = {"1m": 1, "5m": 5, "15m": 5, "30m": 5, "1h": 60}.get(interval, 1)
-    wall_clock_minutes = max(num_points * minutes_per_bar * 6,
-                              7 * 24 * 60)  # at least 7 days
+    # Wall clock minutes needed = (bars × bar minutes) × calendar-to-trading ratio
+    wall_clock_minutes = num_points * minutes_per_bar * 5
+    # Floor: 7 days (so weekend runs always include at least one trading session)
+    # Ceiling: 30 years (EODHD's max intraday coverage)
+    THIRTY_YEARS_MIN = 30 * 365 * 24 * 60
+    SEVEN_DAYS_MIN = 7 * 24 * 60
+    wall_clock_minutes = max(SEVEN_DAYS_MIN, min(wall_clock_minutes, THIRTY_YEARS_MIN))
     from_ts = to_ts - wall_clock_minutes * 60
     return from_ts, to_ts
 
@@ -220,31 +228,75 @@ def _fetch_eod(symbol: str, num_points: int, api_key: str, period: str = "d") ->
 
 def _fetch_intraday(symbol: str, native_interval: str, num_points: int,
                     api_key: str) -> pd.DataFrame:
+    """
+    Fetch intraday data, automatically chunking requests into ≤600-day
+    windows (EODHD's per-request limit). Stitches results together.
+
+    Strategy:
+      - Compute the wall-clock window we need to cover (with weekend safety).
+      - Walk backwards from now in 599-day chunks until we've collected
+        enough bars or we've gone far enough back.
+      - Stop early if a chunk returns no data (we've hit the asset's earliest
+        available history — e.g. TSLA IPO'd 2010, BTC began 2014).
+    """
     from_ts, to_ts = _intraday_range(native_interval, num_points)
-    url = "https://eodhd.com/api/intraday/" + symbol
-    params = {
-        "api_token": api_key,
-        "fmt": "json",
-        "interval": native_interval,
-        "from": from_ts,
-        "to": to_ts,
-    }
-    resp = _get(url, params)
-    rows = resp.json()
-    if not rows:
-        from_iso = dt.datetime.fromtimestamp(from_ts).isoformat(timespec="minutes")
-        to_iso = dt.datetime.fromtimestamp(to_ts).isoformat(timespec="minutes")
-        raise RuntimeError(
-            f"EODHD returned no intraday data for {symbol} {native_interval} "
-            f"from {from_iso} to {to_iso}.\n"
-            f"  HTTP {resp.status_code}, body preview: {resp.text[:200]}\n"
-            f"  Common causes: symbol doesn't have intraday on EODHD, plan "
-            f"doesn't include intraday for this asset class, or the date "
-            f"range hit a no-trading window."
-        )
-    df = pd.DataFrame(rows)
-    df["datetime"] = pd.to_datetime(df["datetime"])
-    df = df.set_index("datetime").sort_index()
+    # EODHD's documented limit is 600 calendar days per request. We use 599
+    # to be safe against off-by-one edge cases.
+    MAX_DAYS_PER_REQUEST = 599
+    MAX_SECONDS_PER_REQUEST = MAX_DAYS_PER_REQUEST * 24 * 3600
+
+    chunks: list[pd.DataFrame] = []
+    total_rows = 0
+    chunk_to = to_ts
+    earliest_reached = False
+    chunk_count = 0
+    MAX_CHUNKS = 50  # safety: cap at ~33 years even if user asked for more
+
+    while chunk_to > from_ts and not earliest_reached and chunk_count < MAX_CHUNKS:
+        chunk_from = max(from_ts, chunk_to - MAX_SECONDS_PER_REQUEST)
+        url = "https://eodhd.com/api/intraday/" + symbol
+        params = {
+            "api_token": api_key,
+            "fmt": "json",
+            "interval": native_interval,
+            "from": chunk_from,
+            "to": chunk_to,
+        }
+        resp = _get(url, params)
+        rows = resp.json()
+        chunk_count += 1
+
+        if not rows:
+            # Empty chunk: usually means we've gone past the asset's history.
+            # Stop walking back further.
+            if not chunks:
+                # No data at all on first try — surface a useful error
+                from_iso = dt.datetime.fromtimestamp(chunk_from).isoformat(timespec="minutes")
+                to_iso = dt.datetime.fromtimestamp(chunk_to).isoformat(timespec="minutes")
+                raise RuntimeError(
+                    f"EODHD returned no intraday data for {symbol} {native_interval} "
+                    f"from {from_iso} to {to_iso}.\n"
+                    f"  HTTP {resp.status_code}, body preview: {resp.text[:200]}\n"
+                    f"  Common causes: symbol doesn't have intraday on EODHD, plan "
+                    f"doesn't include intraday for this asset class, or the date "
+                    f"range hit a no-trading window."
+                )
+            earliest_reached = True
+            break
+
+        df_chunk = pd.DataFrame(rows)
+        df_chunk["datetime"] = pd.to_datetime(df_chunk["datetime"])
+        chunks.append(df_chunk)
+        total_rows += len(df_chunk)
+
+        # Step the to-timestamp back by one full window
+        chunk_to = chunk_from
+
+    if not chunks:
+        raise RuntimeError(f"EODHD: no data fetched for {symbol}")
+
+    df = pd.concat(chunks, ignore_index=True)
+    df = df.drop_duplicates(subset=["datetime"]).set_index("datetime").sort_index()
     out = pd.DataFrame({
         "Open": df["open"].astype(float),
         "High": df["high"].astype(float),

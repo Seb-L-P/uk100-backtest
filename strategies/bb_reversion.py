@@ -27,7 +27,7 @@ import pandas as pd
 from backtest.broker import Broker
 from backtest.engine import Strategy, Signal
 from backtest.indicators import bollinger, atr, volatility_regime
-from strategies._helpers import risk_based_stake
+from strategies._helpers import risk_based_stake, atr_threshold
 
 
 class BollingerReversion:
@@ -37,14 +37,14 @@ class BollingerReversion:
         bb_mult: float = 2.0,
         atr_period: int = 14,
         atr_stop_mult: float = 1.5,
-        stop_buffer_pts: float = 1.0,
+        stop_buffer_atr_mult: float = 0.1,
         require_low_vol_regime: bool = False,
     ):
         self.bb_period = bb_period
         self.bb_mult = bb_mult
         self.atr_period = atr_period
         self.atr_stop_mult = atr_stop_mult
-        self.stop_buffer_pts = stop_buffer_pts
+        self.stop_buffer_atr_mult = stop_buffer_atr_mult
         self.require_low_vol_regime = require_low_vol_regime
 
     def on_bar(self, history: pd.DataFrame, broker: Broker) -> Signal:
@@ -83,9 +83,11 @@ class BollingerReversion:
         bar_high = float(bar["High"])
         bar_low = float(bar["Low"])
 
+        stop_buf = atr_threshold(history, self.stop_buffer_atr_mult, self.atr_period)
+
         if cur_close > cur_upper:
             # Short the stretch
-            stop = bar_high + self.atr_stop_mult * atr_now + self.stop_buffer_pts
+            stop = bar_high + self.atr_stop_mult * atr_now + stop_buf
             risk = stop - cur_close
             if risk <= 0:
                 return Signal(action="noop")
@@ -95,7 +97,7 @@ class BollingerReversion:
                           stop_loss=stop, take_profit=target,
                           reason=f"BB upper={cur_upper:.1f}, close={cur_close:.1f}")
         if cur_close < cur_lower:
-            stop = bar_low - self.atr_stop_mult * atr_now - self.stop_buffer_pts
+            stop = bar_low - self.atr_stop_mult * atr_now - stop_buf
             risk = cur_close - stop
             if risk <= 0:
                 return Signal(action="noop")

@@ -34,10 +34,11 @@ from config import ACCOUNT
 class FvgScaleOut:
     def __init__(
         self,
-        min_gap_points: float = 5.0,
-        max_gap_points: float = 50.0,
+        min_gap_atr_mult: float = 0.5,
+        max_gap_atr_mult: float = 5.0,
         max_age_bars: int = 30,
-        stop_buffer_pts: float = 2.0,
+        stop_buffer_atr_mult: float = 0.2,
+        atr_period: int = 14,
         scale_at_R: float = 1.0,
         scale_fraction: float = 0.5,
         trail_atr_period: int = 14,
@@ -46,10 +47,11 @@ class FvgScaleOut:
         session_close: time = time(15, 0),
         flat_by: time = time(15, 30),
     ):
-        self.min_gap_points = min_gap_points
-        self.max_gap_points = max_gap_points
-        self.max_age_bars = max_age_bars
-        self.stop_buffer_pts = stop_buffer_pts
+        self.min_gap_atr_mult = min_gap_atr_mult
+        self.max_gap_atr_mult = max_gap_atr_mult
+        self.max_age_bars = int(max_age_bars)
+        self.stop_buffer_atr_mult = stop_buffer_atr_mult
+        self.atr_period = int(atr_period)
         self.scale_at_R = scale_at_R
         self.scale_fraction = scale_fraction
         self.trail_atr_period = trail_atr_period
@@ -91,8 +93,12 @@ class FvgScaleOut:
         # ---- Update FVG list ----
         if i != self._last_processed_index:
             self._last_processed_index = i
+            from strategies._helpers import atr_threshold
+            min_gap = atr_threshold(history, self.min_gap_atr_mult, self.atr_period)
+            max_gap = atr_threshold(history, self.max_gap_atr_mult, self.atr_period,
+                                     fallback_pts=1e9)
             new_fvg = detect_fvg(history, i)
-            if new_fvg is not None and self.min_gap_points <= new_fvg.size_points <= self.max_gap_points:
+            if new_fvg is not None and min_gap <= new_fvg.size_points <= max_gap:
                 self._open_fvgs.append(new_fvg)
             self._open_fvgs = [
                 f for f in self._open_fvgs
@@ -145,12 +151,16 @@ class FvgScaleOut:
 
         if fvg.direction == "bullish":
             entry = fvg.near_edge
-            stop = fvg.far_edge - self.stop_buffer_pts
+            from strategies._helpers import atr_threshold
+            stop_buf = atr_threshold(history, self.stop_buffer_atr_mult, self.atr_period)
+            stop = fvg.far_edge - stop_buf
             risk = entry - stop
             action = "open_long"
         else:
             entry = fvg.near_edge
-            stop = fvg.far_edge + self.stop_buffer_pts
+            from strategies._helpers import atr_threshold
+            stop_buf = atr_threshold(history, self.stop_buffer_atr_mult, self.atr_period)
+            stop = fvg.far_edge + stop_buf
             risk = stop - entry
             action = "open_short"
 
@@ -202,7 +212,11 @@ class FvgScaleOut:
             fvg = detect_fvg(history, j)
             if fvg is None:
                 continue
-            if not (self.min_gap_points <= fvg.size_points <= self.max_gap_points):
+            from strategies._helpers import atr_threshold
+            _min_gap = atr_threshold(history, self.min_gap_atr_mult, self.atr_period)
+            _max_gap = atr_threshold(history, self.max_gap_atr_mult, self.atr_period,
+                                       fallback_pts=1e9)
+            if not (_min_gap <= fvg.size_points <= _max_gap):
                 continue
             after = history.iloc[fvg.creator_bar_index + 1: i + 1]
             if fvg.direction == "bullish":

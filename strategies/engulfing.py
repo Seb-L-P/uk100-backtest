@@ -17,17 +17,18 @@ import pandas as pd
 from backtest.broker import Broker
 from backtest.engine import Strategy, Signal
 from backtest.indicators import ema, atr
-from strategies._helpers import risk_based_stake
+from strategies._helpers import risk_based_stake, atr_threshold
 
 
 class EngulfingReversal:
-    def __init__(self, trend_ema_period: int = 20, min_body_pts: float = 5.0,
-                 r_target: float = 2.0, stop_buffer_pts: float = 1.0,
-                 require_trend_context: bool = True):
+    def __init__(self, trend_ema_period: int = 20, min_body_atr_mult: float = 0.5,
+                 r_target: float = 2.0, stop_buffer_atr_mult: float = 0.1,
+                 atr_period: int = 14, require_trend_context: bool = True):
         self.trend_ema_period = int(trend_ema_period)
-        self.min_body_pts = min_body_pts
+        self.min_body_atr_mult = min_body_atr_mult
         self.r_target = r_target
-        self.stop_buffer_pts = stop_buffer_pts
+        self.stop_buffer_atr_mult = stop_buffer_atr_mult
+        self.atr_period = int(atr_period)
         self.require_trend_context = bool(require_trend_context)
 
     def _detect(self, history: pd.DataFrame):
@@ -38,11 +39,13 @@ class EngulfingReversal:
         prev_body = prev["Close"] - prev["Open"]
         curr_body = curr["Close"] - curr["Open"]
 
+        min_body = atr_threshold(history, self.min_body_atr_mult, self.atr_period)
+
         # Bullish engulfing: prev red, curr green, curr body engulfs prev body
         if (prev_body < 0 and curr_body > 0
                 and curr["Open"] <= prev["Close"]
                 and curr["Close"] >= prev["Open"]
-                and abs(curr_body) >= self.min_body_pts):
+                and abs(curr_body) >= min_body):
             if self.require_trend_context:
                 ema_s = ema(history["Close"], self.trend_ema_period)
                 # Reversal context = recent downtrend (EMA slope down)
@@ -54,7 +57,7 @@ class EngulfingReversal:
         if (prev_body > 0 and curr_body < 0
                 and curr["Open"] >= prev["Close"]
                 and curr["Close"] <= prev["Open"]
-                and abs(curr_body) >= self.min_body_pts):
+                and abs(curr_body) >= min_body):
             if self.require_trend_context:
                 ema_s = ema(history["Close"], self.trend_ema_period)
                 if not (ema_s.iloc[-1] > ema_s.iloc[-5]):
@@ -68,11 +71,12 @@ class EngulfingReversal:
             return Signal(action="noop")
         direction, stop_anchor = det
         price = float(history["Close"].iloc[-1])
+        stop_buf = atr_threshold(history, self.stop_buffer_atr_mult, self.atr_period)
         if direction == "long":
-            stop = stop_anchor - self.stop_buffer_pts
+            stop = stop_anchor - stop_buf
             risk = price - stop
         else:
-            stop = stop_anchor + self.stop_buffer_pts
+            stop = stop_anchor + stop_buf
             risk = stop - price
         if risk <= 0:
             return Signal(action="noop")

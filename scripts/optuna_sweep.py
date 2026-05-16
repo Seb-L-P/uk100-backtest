@@ -9,7 +9,7 @@ Usage:
 
 Then pick ONE config from the printed top-10 and evaluate on OOS:
     python scripts/sweep.py --strategy fvg --interval 1h \\
-        --params 'min_gap_points=5;r_target=2.0' --evaluate-oos
+        --params 'min_gap_atr_mult=0.5;r_target=2.0' --evaluate-oos
 """
 from __future__ import annotations
 

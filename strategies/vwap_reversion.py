@@ -3,9 +3,9 @@ VWAP mean reversion — day-trade.
 
 Rules:
   1. Compute session-anchored VWAP (resets each day).
-  2. When price stretches above VWAP by more than `entry_stretch_pts` →
+  2. When price stretches above VWAP by more than `entry_stretch_atr_mult * ATR` →
      enter SHORT (fade back to VWAP).
-  3. When price stretches below by more than `entry_stretch_pts` → enter LONG.
+  3. When price stretches below by more than `entry_stretch_atr_mult * ATR` → enter LONG.
   4. Stop: ATR-based, beyond the entry bar's extreme.
   5. Exit: when price touches VWAP again (target = VWAP).
   6. UK session only, flat by close, one position at a time, max one trade
@@ -34,20 +34,20 @@ from strategies._helpers import risk_based_stake, in_session
 class VwapReversion:
     def __init__(
         self,
-        entry_stretch_pts: float = 15.0,
+        entry_stretch_atr_mult: float = 1.5,  # how far from VWAP (in ATRs) before fading
         atr_period: int = 14,
         atr_stop_mult: float = 1.5,
-        stop_buffer_pts: float = 1.0,
+        stop_buffer_atr_mult: float = 0.1,
         max_trades_per_day: int = 1,
         session_open: time = time(8, 30),
         session_close: time = time(15, 0),
         flat_by: time = time(15, 30),
     ):
-        self.entry_stretch_pts = entry_stretch_pts
-        self.atr_period = atr_period
+        self.entry_stretch_atr_mult = entry_stretch_atr_mult
+        self.atr_period = int(atr_period)
         self.atr_stop_mult = atr_stop_mult
-        self.stop_buffer_pts = stop_buffer_pts
-        self.max_trades_per_day = max_trades_per_day
+        self.stop_buffer_atr_mult = stop_buffer_atr_mult
+        self.max_trades_per_day = int(max_trades_per_day)
         self.session_open = session_open
         self.session_close = session_close
         self.flat_by = flat_by
@@ -98,8 +98,13 @@ class VwapReversion:
         bar_high = float(bar["High"])
         bar_low = float(bar["Low"])
 
-        if stretch > self.entry_stretch_pts:
-            stop = bar_high + self.atr_stop_mult * atr_now + self.stop_buffer_pts
+        # ATR-scaled entry threshold + stop buffer
+        from strategies._helpers import atr_threshold
+        entry_stretch = atr_threshold(history, self.entry_stretch_atr_mult, self.atr_period)
+        stop_buffer = atr_threshold(history, self.stop_buffer_atr_mult, self.atr_period)
+
+        if stretch > entry_stretch:
+            stop = bar_high + self.atr_stop_mult * atr_now + stop_buffer
             risk = stop - cur_close
             if risk <= 0:
                 return Signal(action="noop")
@@ -108,8 +113,8 @@ class VwapReversion:
             return Signal(action="open_short", stake_per_point=stake,
                           stop_loss=stop, take_profit=cur_vwap,
                           reason=f"VWAP stretch +{stretch:.1f}pts")
-        if -stretch > self.entry_stretch_pts:
-            stop = bar_low - self.atr_stop_mult * atr_now - self.stop_buffer_pts
+        if -stretch > entry_stretch:
+            stop = bar_low - self.atr_stop_mult * atr_now - stop_buffer
             risk = cur_close - stop
             if risk <= 0:
                 return Signal(action="noop")
@@ -123,6 +128,7 @@ class VwapReversion:
 
     def proposed_direction(self, history: pd.DataFrame) -> str:
         """For ensemble polling."""
+        from strategies._helpers import atr_threshold
         if len(history) < self.atr_period + 1:
             return "none"
         cur_close = float(history["Close"].iloc[-1])
@@ -130,8 +136,9 @@ class VwapReversion:
         if pd.isna(cur_vwap):
             return "none"
         stretch = cur_close - cur_vwap
-        if stretch > self.entry_stretch_pts:
+        entry_stretch = atr_threshold(history, self.entry_stretch_atr_mult, self.atr_period)
+        if stretch > entry_stretch:
             return "short"
-        if -stretch > self.entry_stretch_pts:
+        if -stretch > entry_stretch:
             return "long"
         return "none"

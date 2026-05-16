@@ -72,24 +72,24 @@ def _find_overlap(a: FVG, b: FVG) -> tuple[float, float] | None:
 class BalancedPriceRange:
     def __init__(
         self,
-        min_fvg_size: float = 3.0,
+        min_fvg_atr_mult: float = 0.3,
         max_fvg_age: int = 50,
-        min_bpr_size: float = 2.0,
+        min_bpr_atr_mult: float = 0.2,
         max_bpr_age: int = 50,
-        stop_buffer_pts: float = 2.0,
+        stop_buffer_atr_mult: float = 0.2,
+        atr_period: int = 14,
         r_target: float = 2.0,
         approach_lookback: int = 5,
         session_open: time = time(9, 0),
         session_close: time = time(15, 0),
         flat_by: time = time(15, 30),
     ):
-        self.min_fvg_size = min_fvg_size
-        # Cast int-typed params defensively — pandas/numpy round-trips can
-        # convert ints to floats, which breaks iloc indexing below.
+        self.min_fvg_atr_mult = min_fvg_atr_mult
         self.max_fvg_age = int(max_fvg_age)
-        self.min_bpr_size = min_bpr_size
+        self.min_bpr_atr_mult = min_bpr_atr_mult
         self.max_bpr_age = int(max_bpr_age)
-        self.stop_buffer_pts = stop_buffer_pts
+        self.stop_buffer_atr_mult = stop_buffer_atr_mult
+        self.atr_period = int(atr_period)
         self.r_target = r_target
         self.approach_lookback = int(approach_lookback)
         self.session_open = session_open
@@ -101,6 +101,7 @@ class BalancedPriceRange:
         self._last_processed_index = -1
 
     def on_bar(self, history: pd.DataFrame, broker: Broker) -> Signal:
+        from strategies._helpers import atr_threshold
         i = len(history) - 1
         bar = history.iloc[i]
         bar_low = float(bar["Low"])
@@ -112,7 +113,7 @@ class BalancedPriceRange:
         if i != self._last_processed_index:
             self._last_processed_index = i
             new_fvg = detect_fvg(history, i)
-            if new_fvg is not None and new_fvg.size_points >= self.min_fvg_size:
+            if new_fvg is not None and new_fvg.size_points >= atr_threshold(history, self.min_fvg_atr_mult, self.atr_period):
                 # Check for BPR overlap with any opposite-direction existing FVG
                 opposite_dir = "bearish" if new_fvg.direction == "bullish" else "bullish"
                 for other in self._fvgs:
@@ -122,7 +123,7 @@ class BalancedPriceRange:
                     if overlap is None:
                         continue
                     low, high = overlap
-                    if high - low >= self.min_bpr_size:
+                    if high - low >= atr_threshold(history, self.min_bpr_atr_mult, self.atr_period):
                         bull = new_fvg if new_fvg.direction == "bullish" else other
                         bear = new_fvg if new_fvg.direction == "bearish" else other
                         self._bprs.append(BPR(
@@ -167,14 +168,14 @@ class BalancedPriceRange:
         if net_move < 0:
             # Approach from above (selling into the BPR) → expect bounce → LONG
             entry = bpr.zone_high  # near edge from above
-            stop = bpr.zone_low - self.stop_buffer_pts
+            stop = bpr.zone_low - atr_threshold(history, self.stop_buffer_atr_mult, self.atr_period)
             risk = entry - stop
             target = entry + self.r_target * risk
             action = "open_long"
         elif net_move > 0:
             # Approach from below (rallying into BPR) → expect rejection → SHORT
             entry = bpr.zone_low
-            stop = bpr.zone_high + self.stop_buffer_pts
+            stop = bpr.zone_high + atr_threshold(history, self.stop_buffer_atr_mult, self.atr_period)
             risk = stop - entry
             target = entry - self.r_target * risk
             action = "open_short"
@@ -202,6 +203,7 @@ class BalancedPriceRange:
         (overlapping opposite-direction FVGs), checks if current bar is in
         a BPR zone, returns direction based on approach.
         """
+        from strategies._helpers import atr_threshold
         i = len(history) - 1
         if i < 2:
             return "none"
@@ -213,7 +215,7 @@ class BalancedPriceRange:
         bear_fvgs: list[FVG] = []
         for j in range(max(2, i - self.max_fvg_age), i):
             fvg = detect_fvg(history, j)
-            if fvg is None or fvg.size_points < self.min_fvg_size:
+            if fvg is None or fvg.size_points < atr_threshold(history, self.min_fvg_atr_mult, self.atr_period):
                 continue
             after = history.iloc[fvg.creator_bar_index + 1: i + 1]
             if fvg.direction == "bullish":
@@ -230,7 +232,7 @@ class BalancedPriceRange:
             for bear in bear_fvgs:
                 low = max(bull.zone_low, bear.zone_low)
                 high = min(bull.zone_high, bear.zone_high)
-                if high - low < self.min_bpr_size:
+                if high - low < atr_threshold(history, self.min_bpr_atr_mult, self.atr_period):
                     continue
                 # Is current bar in the BPR?
                 if bar_high < low or bar_low > high:
