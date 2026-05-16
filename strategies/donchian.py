@@ -92,3 +92,18 @@ class DonchianBreakout:
                           reason=f"donch_down: close<{lower:.1f}")
 
         return Signal(action="noop")
+
+    def proposed_direction(self, history: pd.DataFrame) -> str:
+        """For ensemble polling."""
+        i = len(history) - 1
+        warmup = max(self.channel_lookback, self.atr_period) + 2
+        if i < warmup:
+            return "none"
+        bar_close = float(history.iloc[i]["Close"])
+        upper = trailing_swing(history, i, self.channel_lookback, "high")
+        lower = trailing_swing(history, i, self.channel_lookback, "low")
+        if bar_close > upper:
+            return "long"
+        if bar_close < lower:
+            return "short"
+        return "none"

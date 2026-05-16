@@ -27,6 +27,7 @@ from strategies.bb_reversion import BollingerReversion
 from strategies.vwap_reversion import VwapReversion
 from strategies.rsi_reversion import RsiReversion
 from strategies.fvg_scale_out import FvgScaleOut
+from strategies.mtf_trend_fvg import MtfTrendFvg
 from strategies.ensemble import VoteEnsemble, FilterEnsemble
 
 
@@ -256,6 +257,34 @@ STRATEGIES: dict[str, StrategySpec] = {
                       default=1.5, min=0.5, max=5.0, step=0.25),
             ParamSpec("max_trades_per_day", "Max trades per day", "int",
                       default=1, min=1, max=5, step=1),
+        ],
+    ),
+    "mtf_trend_fvg": StrategySpec(
+        key="mtf_trend_fvg",
+        label="MTF FVG (HTF trend filter)",
+        cls=MtfTrendFvg,
+        warmup_bars=20,
+        description=(
+            "Day-trade. Same limit-order FVG entry as the base FVG strategy, "
+            "but FILTERED by higher-timeframe trend (default: 1h EMA50 + slope). "
+            "Only takes longs in HTF uptrends, shorts in HTF downtrends. "
+            "Trades less but theoretically with the trend on its side."
+        ),
+        params=[
+            ParamSpec("min_gap_points", "Min gap (pts)", "float",
+                      default=5.0, min=1.0, max=50.0, step=0.5),
+            ParamSpec("max_gap_points", "Max gap (pts)", "float",
+                      default=50.0, min=10.0, max=200.0, step=5.0),
+            ParamSpec("max_age_bars", "Max FVG age (bars)", "int",
+                      default=30, min=5, max=200, step=5),
+            ParamSpec("stop_buffer_pts", "Stop buffer (pts)", "float",
+                      default=2.0, min=0.0, max=10.0, step=0.5),
+            ParamSpec("r_target", "Target (R)", "float",
+                      default=2.0, min=0.5, max=5.0, step=0.25),
+            ParamSpec("htf_ema_period", "HTF EMA period", "int",
+                      default=50, min=10, max=200, step=10,
+                      help="EMA on the higher timeframe; trend slope and "
+                           "close-vs-EMA decide bias."),
         ],
     ),
     "fvg_scale_out": StrategySpec(

@@ -126,3 +126,28 @@ class OpeningRangeBreakout:
                           reason=f"ORB down: OR={self._or_low:.1f}-{self._or_high:.1f}")
 
         return Signal(action="noop")
+
+    def proposed_direction(self, history: pd.DataFrame) -> str:
+        """
+        For ensemble polling. Recomputes today's opening range from scratch
+        (stateless) — finds today's bars, takes first N as the OR, checks if
+        current close breaks it.
+        """
+        i = len(history) - 1
+        if i < self.opening_range_bars + 1:
+            return "none"
+        today = history.index[i].date()
+        # Find the first N bars of today's session
+        today_mask = history.index.date == today
+        today_bars = history.loc[today_mask]
+        if len(today_bars) <= self.opening_range_bars:
+            return "none"
+        or_bars = today_bars.iloc[:self.opening_range_bars]
+        or_high = float(or_bars["High"].max())
+        or_low = float(or_bars["Low"].min())
+        cur_close = float(history.iloc[i]["Close"])
+        if cur_close > or_high:
+            return "long"
+        if cur_close < or_low:
+            return "short"
+        return "none"

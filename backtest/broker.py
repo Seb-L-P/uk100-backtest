@@ -26,6 +26,36 @@ from typing import Callable, Literal
 from config import COSTS, ACCOUNT, CostModel, AccountConfig
 
 Side = Literal["long", "short"]
+OrderType = Literal["market", "limit", "stop"]
+
+
+@dataclass
+class PendingOrder:
+    """
+    A pending order sitting in the order book, waiting to be triggered.
+
+    Limit orders fill when price REACHES the trigger from the favourable side
+    (limit buy: price drops to trigger or below; limit sell: price rises to
+    trigger or above). Fill happens at the trigger price (we got our price).
+
+    Stop orders fill when price CROSSES the trigger (stop buy: price rises
+    through trigger; stop sell: price falls through). Fill happens at the
+    trigger price + slippage (we crossed the level, expect worse fill).
+
+    `expires_after_bars`: order is cancelled after this many bars alive.
+    None means "good till cancelled" (lives forever until filled or cancelled).
+    """
+    id: str
+    side: Side
+    order_type: OrderType                       # "limit" or "stop"; not "market"
+    trigger_price: float
+    stake_per_point: float
+    placed_time: datetime
+    stop_loss: float | None = None
+    take_profit: float | None = None
+    trailing_stop_fn: Callable | None = None
+    expires_after_bars: int | None = None
+    bars_alive: int = 0
 
 
 @dataclass
@@ -69,6 +99,10 @@ class OpenPosition:
     # Optional: function called each bar to update stop_loss (trailing stop, etc.)
     # Signature: (position, bar_dict) -> new_stop_loss or None (no change)
     trailing_stop_fn: Callable | None = None
+    # The bid/ask spread observed on the bar this position was opened on.
+    # When set, used (combined with the exit bar's spread) to compute the
+    # round-trip spread cost. None → falls back to config.spread_points.
+    entry_spread_pts: float | None = None
 
 
 class Broker:
@@ -100,7 +134,12 @@ class Broker:
         self.equity_curve: list[tuple[datetime, float]] = []
         self.trades: list[Trade] = []
         self.positions: list[OpenPosition] = []
+        self.pending_orders: list[PendingOrder] = []
         self._next_id = 0
+        self._next_order_id = 0
+        # Number of pending orders that couldn't fill (leverage cap, max
+        # positions). Surfaced in the metrics panel so the user knows.
+        self._dropped_order_count = 0
 
     # ---- Backward-compat: single-position view ------------------------
     @property
@@ -134,6 +173,7 @@ class Broker:
         stop_loss: float | None = None,
         take_profit: float | None = None,
         trailing_stop_fn: Callable | None = None,
+        entry_spread_pts: float | None = None,
     ) -> OpenPosition:
         # Validate leverage against TOTAL notional (existing + new)
         new_notional = stake_per_point * price
@@ -167,6 +207,7 @@ class Broker:
             take_profit=take_profit,
             last_funding_apply=time,
             trailing_stop_fn=trailing_stop_fn,
+            entry_spread_pts=entry_spread_pts,
         )
         self._next_id += 1
         self.positions.append(pos)
@@ -191,28 +232,24 @@ class Broker:
         time_or_price=None,
         price_or_reason=None,
         reason: str = "signal",
+        exit_spread_pts: float | None = None,
     ) -> Trade:
         """
         Close a position. Supports two calling conventions for backward compat:
 
         Multi-position:
-            broker.close(position_or_id, time, price, reason="signal")
+            broker.close(position_or_id, time, price, reason="signal", exit_spread_pts=...)
 
         Single-position (legacy, when only one position is open):
-            broker.close(time, price, reason="signal")
+            broker.close(time, price, reason="signal", exit_spread_pts=...)
         """
-        # Detect which calling convention. If first arg is a datetime or float-like
-        # number that's NOT a position id, it's the legacy single-position style.
         if isinstance(position_or_time, (OpenPosition, str)) or (
             position_or_time is not None and isinstance(position_or_time, str)
         ):
-            # New-style: (position, time, price, reason)
             position = self._resolve(position_or_time)
             time = time_or_price
             price = price_or_reason
-            # reason already from kwarg or default
         else:
-            # Legacy single-position: (time, price, reason=)
             if len(self.positions) != 1:
                 raise RuntimeError(
                     f"Legacy close(time, price) requires exactly one open position; "
@@ -221,11 +258,10 @@ class Broker:
             position = self.positions[0]
             time = position_or_time
             price = time_or_price
-            # Third positional arg in legacy signature was reason
             if isinstance(price_or_reason, str):
                 reason = price_or_reason
 
-        return self._close_full(position, time, price, reason)
+        return self._close_full(position, time, price, reason, exit_spread_pts)
 
     def _close_full(
         self,
@@ -233,12 +269,14 @@ class Broker:
         time: datetime,
         price: float,
         reason: str,
+        exit_spread_pts: float | None = None,
     ) -> Trade:
         """Close 100% of the remaining stake on `position`."""
         return self._close_portion(
             position, time, price,
             portion_stake=position.remaining_stake_per_point,
             reason=reason,
+            exit_spread_pts=exit_spread_pts,
         )
 
     def scale_out(
@@ -248,6 +286,7 @@ class Broker:
         price: float,
         fraction: float,
         reason: str = "scale_out",
+        exit_spread_pts: float | None = None,
     ) -> Trade:
         """Close `fraction` (0 < x ≤ 1) of `position`'s remaining stake.
 
@@ -258,7 +297,27 @@ class Broker:
             raise ValueError(f"fraction must be in (0, 1], got {fraction}")
         position = self._resolve(position_or_id)
         portion = position.remaining_stake_per_point * fraction
-        return self._close_portion(position, time, price, portion, reason)
+        return self._close_portion(position, time, price, portion, reason, exit_spread_pts)
+
+    def _effective_spread_pts(
+        self,
+        position: OpenPosition,
+        exit_spread_pts: float | None,
+    ) -> float:
+        """
+        Determine the spread (in points) to charge for this round-trip.
+
+        - If both entry and exit spreads are known (IG data), use the average
+        - If only one is known, use that one
+        - If neither is known (yfinance data), fall back to config.spread_points
+        """
+        if position.entry_spread_pts is not None and exit_spread_pts is not None:
+            return (position.entry_spread_pts + exit_spread_pts) / 2.0
+        if position.entry_spread_pts is not None:
+            return position.entry_spread_pts
+        if exit_spread_pts is not None:
+            return exit_spread_pts
+        return self.costs.spread_points
 
     def _close_portion(
         self,
@@ -267,6 +326,7 @@ class Broker:
         price: float,
         portion_stake: float,
         reason: str,
+        exit_spread_pts: float | None = None,
     ) -> Trade:
         """Close `portion_stake` of `position`. Removes position if fully closed."""
         if portion_stake <= 0:
@@ -280,9 +340,16 @@ class Broker:
         direction = 1 if position.side == "long" else -1
         gross_pnl = (price - position.entry_price) * direction * portion_stake
 
-        spread_cost = self.costs.spread_points * portion_stake
-        slip_cost = (self.costs.slippage_points * portion_stake
-                     if reason in ("stop", "market") else 0.0)
+        # Per-trade spread (uses bar-specific bid/ask if IG data, else config flat)
+        spread_pts = self._effective_spread_pts(position, exit_spread_pts)
+        spread_cost = spread_pts * portion_stake
+        # Variable slippage: scales with the current bar's spread (when known),
+        # so stops slip more during volatile/news bars and less in calm conditions.
+        if reason in ("stop", "market"):
+            slip_pts = self.costs.effective_slippage_pts(exit_spread_pts)
+            slip_cost = slip_pts * portion_stake
+        else:
+            slip_cost = 0.0
 
         # Financing on this portion (proportional to fraction of full position)
         full_stake = position.stake_per_point
@@ -324,9 +391,128 @@ class Broker:
 
         return trade
 
-    def close_all(self, time: datetime, price: float, reason: str = "close_all") -> list[Trade]:
+    def close_all(self, time: datetime, price: float, reason: str = "close_all",
+                  exit_spread_pts: float | None = None) -> list[Trade]:
         """Close every open position at the given price. Returns list of trades."""
-        return [self._close_full(p, time, price, reason) for p in list(self.positions)]
+        return [self._close_full(p, time, price, reason, exit_spread_pts)
+                for p in list(self.positions)]
+
+    # ---- Pending orders (limit / stop) -------------------------------
+    def place_pending_order(
+        self,
+        side: Side,
+        order_type: OrderType,
+        trigger_price: float,
+        stake_per_point: float,
+        time: datetime,
+        stop_loss: float | None = None,
+        take_profit: float | None = None,
+        trailing_stop_fn: Callable | None = None,
+        expires_after_bars: int | None = None,
+    ) -> PendingOrder:
+        """Place a limit or stop order in the order book."""
+        if order_type not in ("limit", "stop"):
+            raise ValueError(f"order_type must be 'limit' or 'stop', got {order_type!r}")
+        order = PendingOrder(
+            id=f"o{self._next_order_id}",
+            side=side,
+            order_type=order_type,
+            trigger_price=trigger_price,
+            stake_per_point=stake_per_point,
+            placed_time=time,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            trailing_stop_fn=trailing_stop_fn,
+            expires_after_bars=expires_after_bars,
+        )
+        self._next_order_id += 1
+        self.pending_orders.append(order)
+        return order
+
+    def cancel_pending_order(self, order_id: str) -> bool:
+        """Cancel a pending order by id. Returns True if found and cancelled."""
+        for o in self.pending_orders:
+            if o.id == order_id:
+                self.pending_orders.remove(o)
+                return True
+        return False
+
+    def cancel_all_pending(self) -> int:
+        """Cancel every pending order. Returns the number cancelled."""
+        n = len(self.pending_orders)
+        self.pending_orders.clear()
+        return n
+
+    def check_pending_orders(self, time: datetime, bar: dict,
+                             bar_spread: float | None = None) -> list[OpenPosition]:
+        """
+        Check each pending order against this bar's range. Fill any that triggered.
+
+        Fill price model:
+          - Limit: filled at the trigger price exactly (you got your price).
+          - Stop: filled at the trigger price + slippage (you crossed and slipped).
+
+        Order processing order on a bar is determined by `pending_orders` list
+        order (insertion order); this matters if two orders interact (e.g. one
+        that breaches leverage after the first fills).
+
+        If a triggered order can't fill (leverage cap, max positions), it's
+        silently removed and a warning printed — same as a failed direct open.
+        """
+        newly_opened: list[OpenPosition] = []
+        for order in list(self.pending_orders):
+            order.bars_alive += 1
+            if (order.expires_after_bars is not None
+                    and order.bars_alive > order.expires_after_bars):
+                self.pending_orders.remove(order)
+                continue
+
+            triggered, fill_price = self._check_order_trigger(order, bar, bar_spread)
+            if not triggered:
+                continue
+
+            try:
+                pos = self.open(
+                    side=order.side,
+                    stake_per_point=order.stake_per_point,
+                    time=time,
+                    price=fill_price,
+                    stop_loss=order.stop_loss,
+                    take_profit=order.take_profit,
+                    trailing_stop_fn=order.trailing_stop_fn,
+                    entry_spread_pts=bar_spread,
+                )
+                newly_opened.append(pos)
+            except (ValueError, RuntimeError) as e:
+                # Common (and usually expected): leverage cap or max-positions
+                # hit. Count silently — the run-end summary surfaces the count
+                # without spamming the console. Strategies are expected to
+                # manage their own order density.
+                self._dropped_order_count += 1
+            self.pending_orders.remove(order)
+        return newly_opened
+
+    def _check_order_trigger(self, order: PendingOrder, bar: dict,
+                             bar_spread: float | None = None) -> tuple[bool, float]:
+        """Return (triggered, fill_price) given the bar's high/low range."""
+        low, high = bar["Low"], bar["High"]
+        if order.order_type == "limit":
+            # Limit buy: fill if price drops to trigger or below.
+            # Limit sell: fill if price rises to trigger or above.
+            if order.side == "long" and low <= order.trigger_price:
+                return True, order.trigger_price
+            if order.side == "short" and high >= order.trigger_price:
+                return True, order.trigger_price
+        elif order.order_type == "stop":
+            # Stop buy: fill if price rises through trigger (worse fill via slippage).
+            # Stop sell: fill if price falls through trigger.
+            # Slippage scales with the current bar's spread when known.
+            slip = self.costs.effective_slippage_pts(bar_spread)
+            if order.side == "long" and high >= order.trigger_price:
+                return True, order.trigger_price + slip
+            if order.side == "short" and low <= order.trigger_price:
+                return True, order.trigger_price - slip
+        return False, 0.0
 
     # ---- Per-bar updates ----------------------------------------------
     def mark(self, time: datetime, bar: dict) -> None:
@@ -376,22 +562,24 @@ class Broker:
     def check_stops(self, time: datetime, bar: dict) -> list[Trade]:
         """Check ALL open positions for stop/target hits. Return list of trades closed."""
         closed: list[Trade] = []
+        bar_spread = bar.get("Spread")  # None if not present (yfinance data)
         for pos in list(self.positions):  # iterate over copy — close may mutate
-            trade = self._check_one_position_stops(pos, time, bar)
+            trade = self._check_one_position_stops(pos, time, bar, bar_spread)
             if trade is not None:
                 closed.append(trade)
         return closed
 
-    def _check_one_position_stops(self, pos: OpenPosition, time: datetime, bar: dict) -> Trade | None:
+    def _check_one_position_stops(self, pos: OpenPosition, time: datetime, bar: dict,
+                                  bar_spread: float | None = None) -> Trade | None:
         # Conservative: if both stop and target inside the bar, assume stop first
         if pos.side == "long":
             if pos.stop_loss is not None and bar["Low"] <= pos.stop_loss:
-                return self._close_full(pos, time, pos.stop_loss, "stop")
+                return self._close_full(pos, time, pos.stop_loss, "stop", bar_spread)
             if pos.take_profit is not None and bar["High"] >= pos.take_profit:
-                return self._close_full(pos, time, pos.take_profit, "target")
+                return self._close_full(pos, time, pos.take_profit, "target", bar_spread)
         else:
             if pos.stop_loss is not None and bar["High"] >= pos.stop_loss:
-                return self._close_full(pos, time, pos.stop_loss, "stop")
+                return self._close_full(pos, time, pos.stop_loss, "stop", bar_spread)
             if pos.take_profit is not None and bar["Low"] <= pos.take_profit:
-                return self._close_full(pos, time, pos.take_profit, "target")
+                return self._close_full(pos, time, pos.take_profit, "target", bar_spread)
         return None

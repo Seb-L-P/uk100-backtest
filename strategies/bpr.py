@@ -84,12 +84,14 @@ class BalancedPriceRange:
         flat_by: time = time(15, 30),
     ):
         self.min_fvg_size = min_fvg_size
-        self.max_fvg_age = max_fvg_age
+        # Cast int-typed params defensively — pandas/numpy round-trips can
+        # convert ints to floats, which breaks iloc indexing below.
+        self.max_fvg_age = int(max_fvg_age)
         self.min_bpr_size = min_bpr_size
-        self.max_bpr_age = max_bpr_age
+        self.max_bpr_age = int(max_bpr_age)
         self.stop_buffer_pts = stop_buffer_pts
         self.r_target = r_target
-        self.approach_lookback = approach_lookback
+        self.approach_lookback = int(approach_lookback)
         self.session_open = session_open
         self.session_close = session_close
         self.flat_by = flat_by
@@ -193,3 +195,53 @@ class BalancedPriceRange:
         return Signal(action=action, stake_per_point=stake,
                       stop_loss=stop, take_profit=target,
                       reason=f"BPR size={bpr.size_points:.1f}, approach={'down' if net_move<0 else 'up'}")
+
+    def proposed_direction(self, history: pd.DataFrame) -> str:
+        """
+        For ensemble polling. Stateless: scans recent FVGs to find any BPR
+        (overlapping opposite-direction FVGs), checks if current bar is in
+        a BPR zone, returns direction based on approach.
+        """
+        i = len(history) - 1
+        if i < 2:
+            return "none"
+        bar = history.iloc[i]
+        bar_low, bar_high, bar_close = float(bar["Low"]), float(bar["High"]), float(bar["Close"])
+
+        # Collect recent valid FVGs (not yet fully filled)
+        bull_fvgs: list[FVG] = []
+        bear_fvgs: list[FVG] = []
+        for j in range(max(2, i - self.max_fvg_age), i):
+            fvg = detect_fvg(history, j)
+            if fvg is None or fvg.size_points < self.min_fvg_size:
+                continue
+            after = history.iloc[fvg.creator_bar_index + 1: i + 1]
+            if fvg.direction == "bullish":
+                if not after.empty and bool((after["Low"] <= fvg.zone_low).any()):
+                    continue
+                bull_fvgs.append(fvg)
+            else:
+                if not after.empty and bool((after["High"] >= fvg.zone_high).any()):
+                    continue
+                bear_fvgs.append(fvg)
+
+        # Find BPRs = overlaps between bullish and bearish FVGs
+        for bull in bull_fvgs:
+            for bear in bear_fvgs:
+                low = max(bull.zone_low, bear.zone_low)
+                high = min(bull.zone_high, bear.zone_high)
+                if high - low < self.min_bpr_size:
+                    continue
+                # Is current bar in the BPR?
+                if bar_high < low or bar_low > high:
+                    continue
+                # Direction based on approach
+                if i < self.approach_lookback:
+                    return "none"
+                recent_close = float(history["Close"].iloc[i - self.approach_lookback])
+                net_move = bar_close - recent_close
+                if net_move < 0:
+                    return "long"
+                if net_move > 0:
+                    return "short"
+        return "none"

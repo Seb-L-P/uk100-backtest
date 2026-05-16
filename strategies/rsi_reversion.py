@@ -97,3 +97,16 @@ class RsiReversion:
                           reason=f"RSI hook down from {prev_rsi:.1f}")
 
         return Signal(action="noop")
+
+    def proposed_direction(self, history: pd.DataFrame) -> str:
+        """For ensemble polling."""
+        if len(history) < max(self.rsi_period, self.atr_period) + 3:
+            return "none"
+        rsi_series = rsi(history["Close"], self.rsi_period)
+        cur_rsi = float(rsi_series.iloc[-1])
+        prev_rsi = float(rsi_series.iloc[-2])
+        if prev_rsi < self.oversold and cur_rsi > prev_rsi:
+            return "long"
+        if prev_rsi > self.overbought and cur_rsi < prev_rsi:
+            return "short"
+        return "none"

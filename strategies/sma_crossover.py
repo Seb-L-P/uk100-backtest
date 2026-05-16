@@ -74,6 +74,22 @@ class SmaCrossover:
             )
 
 
+    def proposed_direction(self, history: pd.DataFrame) -> str:
+        """For ensemble polling — what direction would I take RIGHT NOW?"""
+        if len(history) < max(self.slow, self.atr_period) + 2:
+            return "none"
+        close = history["Close"]
+        fast_sma = close.rolling(self.fast).mean()
+        slow_sma = close.rolling(self.slow).mean()
+        f_now, f_prev = fast_sma.iloc[-1], fast_sma.iloc[-2]
+        s_now, s_prev = slow_sma.iloc[-1], slow_sma.iloc[-2]
+        if f_prev <= s_prev and f_now > s_now:
+            return "long"
+        if f_prev >= s_prev and f_now < s_now:
+            return "short"
+        return "none"
+
+
 def _atr(history: pd.DataFrame, period: int) -> pd.Series:
     h, l, c = history["High"], history["Low"], history["Close"]
     prev_close = c.shift(1)

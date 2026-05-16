@@ -106,3 +106,20 @@ class BollingerReversion:
                           reason=f"BB lower={cur_lower:.1f}, close={cur_close:.1f}")
 
         return Signal(action="noop")
+
+    def proposed_direction(self, history: pd.DataFrame) -> str:
+        """For ensemble polling."""
+        if len(history) < max(self.bb_period, self.atr_period) + 2:
+            return "none"
+        close = history["Close"]
+        _mid, upper, lower = bollinger(close, self.bb_period, self.bb_mult)
+        cur_close = float(close.iloc[-1])
+        if self.require_low_vol_regime:
+            regime = volatility_regime(history, self.atr_period).iloc[-1]
+            if regime == 1:
+                return "none"
+        if cur_close > float(upper.iloc[-1]):
+            return "short"
+        if cur_close < float(lower.iloc[-1]):
+            return "long"
+        return "none"

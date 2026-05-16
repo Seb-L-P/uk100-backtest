@@ -24,6 +24,79 @@ import pandas as pd
 Direction = Literal["bullish", "bearish"]
 
 
+# ---- Multi-timeframe resampling ---------------------------------------
+# pandas frequency aliases that our intervals map to.
+_RESAMPLE_RULE = {
+    "1m": "1min", "2m": "2min", "5m": "5min", "10m": "10min",
+    "15m": "15min", "30m": "30min",
+    "1h": "1h", "2h": "2h", "4h": "4h",
+    "1d": "1D", "1wk": "1W",
+}
+
+
+def to_higher_timeframe(
+    history: pd.DataFrame,
+    target_interval: str,
+    include_partial: bool = False,
+) -> pd.DataFrame:
+    """
+    Resample a base-timeframe OHLCV DataFrame to a higher timeframe.
+
+    Use this inside a strategy's `on_bar` / `proposed_direction` to get HTF
+    context for free, without needing a separate IG fetch:
+
+        htf = to_higher_timeframe(history, "1h")
+        htf_ema200 = ema(htf["Close"], 200).iloc[-1]
+        if cur_close > htf_ema200:
+            # in HTF uptrend...
+
+    Args:
+        history: base DataFrame with O/H/L/C (and optionally Volume, Spread).
+        target_interval: one of our standard intervals — "1h", "4h", "1d", etc.
+        include_partial: if True, includes the still-forming last HTF bar
+            (its OHLC values reflect only the base bars seen so far).
+            Default False — drops the partial last bar to prevent any chance
+            of look-ahead. **Use True only when you genuinely want intra-bar
+            HTF info (e.g., "is today's high above yesterday's close?").**
+
+    Returns the resampled DataFrame, aligned to clock boundaries (e.g., 1h
+    bars start on the hour). Standard pandas semantics — empty bars dropped.
+
+    Look-ahead safety: when `include_partial=False`, we drop the last HTF
+    bar if the latest base bar falls inside it (meaning the HTF bar isn't
+    yet complete). This is the safe default.
+    """
+    if target_interval not in _RESAMPLE_RULE:
+        raise ValueError(f"Unknown target_interval {target_interval!r}. "
+                         f"Valid: {list(_RESAMPLE_RULE)}")
+    rule = _RESAMPLE_RULE[target_interval]
+
+    agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last"}
+    if "Volume" in history.columns:
+        agg["Volume"] = "sum"
+    if "Spread" in history.columns:
+        agg["Spread"] = "mean"
+
+    # label="left" / closed="left": bar timestamps are bar START times;
+    # bars include their start moment, exclude the next.
+    resampled = history.resample(rule, label="left", closed="left").agg(agg)
+    resampled = resampled.dropna(subset=["Open", "High", "Low", "Close"])
+
+    if not include_partial and len(resampled) > 0:
+        # Determine if the most recent HTF bar is "complete" — i.e., the base
+        # data extends past the end of that HTF window. If not, drop it.
+        last_htf_start = resampled.index[-1]
+        htf_period = pd.tseries.frequencies.to_offset(rule)
+        last_htf_end = last_htf_start + htf_period
+        last_base_time = history.index[-1]
+        # An HTF bar at 14:00 with 1h period ends at 15:00. We consider it
+        # complete only if the latest base bar's timestamp is >= 15:00.
+        if last_base_time < last_htf_end:
+            resampled = resampled.iloc[:-1]
+
+    return resampled
+
+
 # ---- Moving averages ----------------------------------------------------
 def sma(series: pd.Series, period: int) -> pd.Series:
     """Simple moving average."""

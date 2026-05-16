@@ -35,6 +35,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from data.fetcher import fetch
+from config import COSTS
 from backtest.engine import run_backtest
 from backtest.metrics import compute_metrics
 from backtest.validation import (
@@ -42,6 +43,8 @@ from backtest.validation import (
     adaptive_walk_forward, deflated_sharpe_ratio, holdout_split,
 )
 from backtest.sweep import grid_sweep, evaluate_oos
+from backtest.optuna_search import run_optuna_study
+from backtest.run_history import save_run, list_runs, delete_run, count_runs
 from strategies import registry as reg
 from strategies.ensemble import VoteEnsemble, FilterEnsemble
 
@@ -117,15 +120,18 @@ with st.sidebar:
     interval = st.selectbox("Interval", list(BARS_PER_YEAR.keys()), index=2)
     mode = st.radio(
         "Mode",
-        ["Single backtest", "Full validation", "Parameter sweep", "Adaptive walk-forward"],
+        ["Single backtest", "Full validation", "Parameter sweep",
+         "Bayesian sweep", "Adaptive walk-forward"],
         index=0,
         help=("Single = one run. Validation = IS/OOS + walk-forward + bootstrap. "
-              "Sweep = grid-search params on IS, pick best, evaluate on OOS. "
+              "Sweep = grid search on IS. Bayesian = Optuna TPE — smarter "
+              "param search, finds good configs in fewer trials. "
               "Adaptive = re-fit params each fold, test on next."),
     )
 
     # Mode-specific settings
     oos_fraction, n_folds, n_mc, min_trades, optimize_by = 0.2, 4, 1000, 30, "sharpe"
+    n_trials, opt_metric, target_trades = 100, "wf_consistency", 50
     if mode == "Full validation":
         with st.expander("Validation settings"):
             oos_fraction = st.slider("Out-of-sample fraction", 0.1, 0.4, 0.2, 0.05)
@@ -148,17 +154,36 @@ with st.sidebar:
                 ["sharpe", "profit_factor", "total_return_pct"],
                 index=0, key="adapt_metric",
             )
+    elif mode == "Bayesian sweep":
+        with st.expander("Bayesian sweep settings", expanded=True):
+            oos_fraction = st.slider("Out-of-sample fraction", 0.1, 0.4, 0.2, 0.05,
+                                     key="bayes_oos")
+            n_folds = st.slider("Walk-forward folds (per trial)", 2, 6, 4, key="bayes_folds")
+            n_trials = st.slider("Number of trials", 20, 500, 100, 10, key="bayes_trials",
+                                 help="Optuna explores adaptively — usually finds great configs in 50-200 trials.")
+            target_trades = st.slider("Target trades (penalty floor)", 10, 200, 50, 5,
+                                      key="bayes_target_trades",
+                                      help="Configs with fewer trades get a linear penalty. "
+                                           "Prevents Optuna from gaming thin-trade flukes.")
+            opt_metric = st.selectbox(
+                "Optimize",
+                ["wf_consistency", "sharpe", "profit_factor"],
+                index=0, key="bayes_metric",
+                help="wf_consistency is the most overfit-resistant; sharpe and PF are flashier but easier to overfit to."
+            )
 
     st.divider()
 
-    # Sweep / adaptive modes use grid inputs instead of single sliders.
+    # Sweep / adaptive / Bayesian modes use the param search machinery
     is_grid_mode = mode in ("Parameter sweep", "Adaptive walk-forward")
+    is_optuna_mode = mode == "Bayesian sweep"
+    is_search_mode = is_grid_mode or is_optuna_mode
 
-    # Custom ensemble + grid mode is not supported (factory composition is too
-    # tangled to safely sweep over). Force registry mode in that combination.
-    if is_grid_mode and build_mode == "Build custom ensemble":
+    # Custom ensemble + search modes are not supported (factory composition is
+    # too tangled to safely sweep over). Force registry mode in that combination.
+    if is_search_mode and build_mode == "Build custom ensemble":
         st.warning("Custom ensembles can't be swept (yet). Switch to "
-                   "'Pick from registry' for sweep / adaptive WF.")
+                   "'Pick from registry' for sweep / Bayesian / adaptive WF.")
         build_mode = "Pick from registry"
 
     # ---- Branch A: Registry mode ---------------------------------------
@@ -174,7 +199,13 @@ with st.sidebar:
         param_values: dict[str, Any] = {}
         param_grid: dict[str, list] = {}
 
-        if is_grid_mode:
+        if is_optuna_mode:
+            st.subheader("Strategy parameters")
+            st.caption(
+                f"Optuna will search the param ranges defined in the registry "
+                f"({len(spec.params or [])} params). No manual grid needed."
+            )
+        elif is_grid_mode:
             st.subheader("Parameter grid")
             st.caption("Comma-separated values per param. One value = fixed.")
             for p in (spec.params or []):
@@ -363,8 +394,81 @@ has_cached_awf = (mode == "Adaptive walk-forward"
                   and st.session_state.get("awf_result") is not None
                   and st.session_state.get("awf_hash") is not None)
 
+def _render_run_history():
+    """Show recent runs from the SQLite history. Filterable, deletable."""
+    n_runs = count_runs()
+    with st.expander(f"📜 Run history ({n_runs} saved)", expanded=False):
+        if n_runs == 0:
+            st.caption("No runs saved yet. Run a backtest and it'll appear here.")
+            return
+
+        c1, c2, c3 = st.columns([2, 1, 1])
+        with c1:
+            filter_strategy = st.text_input(
+                "Filter by strategy key (e.g. 'fvg', 'rsi_revert')",
+                value="", key="history_filter_strategy",
+            )
+        with c2:
+            min_sharpe = st.number_input(
+                "Min Sharpe", value=-5.0, step=0.1, key="history_min_sharpe",
+            )
+        with c3:
+            limit = st.number_input(
+                "Show last N", min_value=5, max_value=500, value=25, step=5,
+                key="history_limit",
+            )
+
+        runs = list_runs(
+            limit=int(limit),
+            strategy_key=filter_strategy.strip() or None,
+            min_sharpe=min_sharpe if min_sharpe > -4.9 else None,
+        )
+        if not runs:
+            st.caption("No runs match the filters.")
+            return
+
+        rows = []
+        for r in runs:
+            params = json.loads(r["params_json"]) if r["params_json"] else {}
+            params_str = ", ".join(f"{k}={v}" for k, v in params.items())
+            rows.append({
+                "id": r["id"],
+                "when": r["timestamp"],
+                "strategy": r["strategy_label"] or r["strategy_key"],
+                "ticker": r["ticker"],
+                "interval": r["interval"],
+                "src": r["source"],
+                "mode": r["mode"],
+                "trades": r["num_trades"],
+                "ret_%": r["total_return_pct"],
+                "sharpe": r["sharpe"],
+                "pf": r["profit_factor"],
+                "max_dd_%": r["max_drawdown_pct"],
+                "params": params_str[:80] + ("..." if len(params_str) > 80 else ""),
+            })
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
+        c1, c2 = st.columns([3, 1])
+        with c1:
+            del_id = st.number_input(
+                "Delete run id", min_value=0, value=0, step=1,
+                help="Type a run id from the table above and click Delete.",
+                key="history_del_id",
+            )
+        with c2:
+            if st.button("Delete", key="history_del_button"):
+                if del_id > 0:
+                    if delete_run(int(del_id)):
+                        st.success(f"Deleted run {del_id}. Rerun the page to refresh.")
+                    else:
+                        st.warning(f"No run with id {del_id}.")
+
+
 if not run_clicked and not has_cached_sweep and not has_cached_awf:
     st.info("Configure on the left, then click **Run backtest**.")
+    # Run-history widget so the user can browse past runs without
+    # having to run a fresh backtest first.
+    _render_run_history()
     st.stop()
 
 try:
@@ -381,6 +485,20 @@ except Exception as e:
     st.stop()
 
 st.write(f"**Data:** {len(data)} bars from {data.index[0]} to {data.index[-1]}")
+if "Spread" in data.columns:
+    spread_series = data["Spread"].dropna()
+    if not spread_series.empty:
+        st.caption(
+            f"📊 Per-bar spread from IG: avg **{spread_series.mean():.2f}pt**, "
+            f"min {spread_series.min():.2f}pt, max {spread_series.max():.2f}pt, "
+            f"median {spread_series.median():.2f}pt — used per-trade instead of "
+            f"the flat {COSTS.spread_points:.1f}pt config default."
+        )
+else:
+    st.caption(
+        f"📊 Using flat **{COSTS.spread_points:.1f}pt** spread from config "
+        f"(yfinance has no bid/ask data — switch to IG demo for per-bar real spreads)."
+    )
 bpy = BARS_PER_YEAR.get(interval, 252)
 
 
@@ -633,6 +751,25 @@ if mode == "Single backtest":
         result = run_backtest(data, strategy_factory(), warmup_bars=warmup_bars)
         m = compute_metrics(result, bars_per_year=bpy)
 
+    # Auto-save to run history (only fresh runs, not cached re-renders)
+    run_key = f"{display_label}_{ticker}_{interval}_{mode}_{hash(str(param_values) if 'param_values' in dir() else '')}"
+    if st.session_state.get("last_saved_run_key") != run_key:
+        try:
+            saved_params = param_values if "param_values" in dir() and param_values else {}
+            save_run(
+                strategy_key=strategy_key if "strategy_key" in dir() else "custom",
+                strategy_label=display_label,
+                params=saved_params,
+                ticker=ticker, interval=interval,
+                source=("ig" if use_ig else "yfinance"),
+                mode="single",
+                result=result, metrics=m,
+            )
+            st.session_state["last_saved_run_key"] = run_key
+        except Exception as e:
+            # Don't let saving break the backtest display
+            st.caption(f"⚠️ Run not saved to history: {e}")
+
     metrics_panel(m, label="Results")
     st.plotly_chart(
         equity_chart(result.equity_curve, price=data["Close"],
@@ -641,6 +778,70 @@ if mode == "Single backtest":
     )
     with st.expander(f"Trades log ({len(result.trades_df)} trades)"):
         st.dataframe(result.trades_df, width="stretch")
+
+    # ---- Performance attribution ----------------------------------------
+    if not result.trades_df.empty:
+        from backtest.attribution import (
+            by_hour_of_day, by_day_of_week, by_month,
+            by_session_phase, by_side, by_exit_reason,
+            equity_drawdown_series,
+        )
+        with st.expander("📊 Performance attribution — when does the strategy actually work?"):
+            st.caption(
+                "Breakdowns of the trade log by various dimensions. Look for "
+                "concentrations: if one hour/day/month dominates the P&L, the "
+                "result is fragile. If it's spread evenly, the edge is more credible."
+            )
+
+            tab_h, tab_d, tab_m, tab_s, tab_side, tab_exit, tab_dd = st.tabs(
+                ["Hour of day", "Day of week", "Month",
+                 "Session phase", "Long vs short", "Exit reason", "Drawdown"]
+            )
+            with tab_h:
+                df_h = by_hour_of_day(result.trades_df)
+                st.dataframe(df_h, width="stretch", hide_index=True)
+                if not df_h.empty:
+                    fig_h = go.Figure()
+                    fig_h.add_trace(go.Bar(x=df_h["hour"], y=df_h["total_pnl_gbp"],
+                                           marker_color=["green" if v > 0 else "red"
+                                                         for v in df_h["total_pnl_gbp"]],
+                                           name="P&L"))
+                    fig_h.update_layout(title="P&L by entry hour",
+                                        xaxis_title="Hour of day",
+                                        yaxis_title="Total P&L (£)",
+                                        height=300, margin=dict(l=10, r=10, t=40, b=10))
+                    st.plotly_chart(fig_h, width="stretch")
+            with tab_d:
+                df_d = by_day_of_week(result.trades_df)
+                st.dataframe(df_d, width="stretch", hide_index=True)
+            with tab_m:
+                df_m = by_month(result.trades_df)
+                st.dataframe(df_m, width="stretch", hide_index=True)
+            with tab_s:
+                df_s = by_session_phase(result.trades_df, open_hour=8, close_hour=16)
+                st.dataframe(df_s, width="stretch", hide_index=True)
+            with tab_side:
+                df_side = by_side(result.trades_df)
+                st.dataframe(df_side, width="stretch", hide_index=True)
+            with tab_exit:
+                df_exit = by_exit_reason(result.trades_df)
+                st.dataframe(df_exit, width="stretch", hide_index=True)
+            with tab_dd:
+                dd = equity_drawdown_series(result.equity_curve)
+                if not dd.empty:
+                    fig_dd = go.Figure()
+                    fig_dd.add_trace(go.Scatter(
+                        x=dd.index, y=dd.values, fill="tozeroy",
+                        fillcolor="rgba(220,50,50,0.3)",
+                        line=dict(color="red", width=1),
+                        name="Drawdown",
+                    ))
+                    fig_dd.update_layout(
+                        title="Underwater equity (drawdown from peak)",
+                        yaxis_title="Drawdown (%)",
+                        height=300, margin=dict(l=10, r=10, t=40, b=10),
+                    )
+                    st.plotly_chart(fig_dd, width="stretch")
 
     # ---- Trade inspector --------------------------------------------------
     if not result.trades_df.empty:
@@ -918,7 +1119,20 @@ elif mode == "Parameter sweep":
         picked_row = sorted_df.iloc[picked_idx]
 
         if st.button("Evaluate on out-of-sample", type="primary"):
-            picked_params = {c: picked_row[c] for c in param_cols}
+            # Coerce values back to their declared types — DataFrame round-trip
+            # converts ints to numpy float64, which breaks strategies that use
+            # int params as iloc indices (e.g. BPR's approach_lookback).
+            type_map = {p.name: p.type for p in (spec.params or [])}
+            picked_params = {}
+            for c in param_cols:
+                raw = picked_row[c]
+                t = type_map.get(c)
+                if t == "int":
+                    picked_params[c] = int(raw)
+                elif t == "bool":
+                    picked_params[c] = bool(raw)
+                else:
+                    picked_params[c] = float(raw)
             with st.spinner("Running OOS evaluation..."):
                 try:
                     factory = factory_for_params(picked_params)
@@ -1050,3 +1264,129 @@ elif mode == "Adaptive walk-forward":
             )
         else:
             st.info("🟡 Borderline — moderate consistency. Inconclusive.")
+
+
+elif mode == "Bayesian sweep":
+    # Cache by config — same pattern as grid sweep
+    bayes_config = {
+        "strategy": display_label, "ticker": ticker, "interval": interval,
+        "n_trials": n_trials, "oos_fraction": oos_fraction, "n_folds": n_folds,
+        "opt_metric": opt_metric, "target_trades": target_trades,
+    }
+    bayes_hash = hashlib.md5(
+        json.dumps(bayes_config, sort_keys=True, default=str).encode()
+    ).hexdigest()
+    if st.session_state.get("bayes_hash") != bayes_hash:
+        st.session_state["bayes_hash"] = bayes_hash
+        st.session_state["bayes_result"] = None
+        st.session_state["bayes_oos_eval"] = None
+
+    if st.session_state.get("bayes_result") is None:
+        st.write(f"Will run **{n_trials} Optuna TPE trials** on the in-sample slice "
+                 f"(reserving last {oos_fraction:.0%} for OOS).")
+        st.caption(f"Optimising for: **{opt_metric}** with trade-count penalty (target {target_trades} trades).")
+        if not run_clicked:
+            st.info("Click **Run backtest** to start the Bayesian search.")
+            st.stop()
+
+        progress = st.progress(0.0, text="Starting Optuna...")
+        last_msg = st.empty()
+
+        def on_progress(i, n, params):
+            progress.progress(min(1.0, i / n), text=f"Trial {i}/{n}")
+            last_msg.caption(f"Latest: {params}")
+
+        try:
+            opt_result = run_optuna_study(
+                data, spec, factory_for_params=factory_for_params,
+                n_trials=n_trials, oos_fraction=oos_fraction, n_folds=n_folds,
+                warmup_bars=warmup_bars, bars_per_year=bpy,
+                target_trades=target_trades, optimization_metric=opt_metric,
+                progress_callback=on_progress,
+            )
+            st.session_state["bayes_result"] = opt_result
+            progress.empty()
+            last_msg.empty()
+        except Exception as e:
+            st.error(f"Bayesian sweep failed: {e}")
+            st.stop()
+
+    opt_result = st.session_state["bayes_result"]
+    df = opt_result.summary_df()
+    st.success(f"Bayesian sweep complete: {len(opt_result.trials)} trials. "
+               f"Best score: {opt_result.best_score:.3f}.")
+
+    if df.empty:
+        st.warning("No usable trials. Try more trials, broader param ranges, or different optimisation metric.")
+        st.stop()
+
+    # Filter for sensible trade count
+    valid = df[df["trades"] >= 30] if "trades" in df.columns else df
+    st.caption(f"{len(valid)} trials with ≥30 trades.")
+
+    sort_options = [c for c in ["score", "wf_consistency", "sharpe", "profit_factor",
+                                "return_%", "trades", "max_dd_%"] if c in df.columns]
+    sort_by = st.selectbox("Sort by", sort_options, index=0)
+    ascending = sort_by == "max_dd_%"
+    sorted_df = (valid if not valid.empty else df).sort_values(sort_by, ascending=ascending)
+
+    st.subheader("Trial results")
+    st.dataframe(sorted_df, width="stretch", hide_index=True)
+
+    # OOS evaluation step (same as grid sweep)
+    st.divider()
+    st.subheader("Step 2 — pick ONE config, evaluate on out-of-sample")
+    st.warning(
+        "⚠️ Pick the config you'd commit to. The OOS result is your honest "
+        "verdict — re-running on different params after seeing OOS contaminates the test."
+    )
+    param_cols = [c for c in sorted_df.columns
+                  if c not in ("trades", "sharpe", "profit_factor", "return_%",
+                               "max_dd_%", "win_rate_%", "wf_consistency", "score")]
+
+    def _row_label(row):
+        params_str = ", ".join(f"{c}={row[c]}" for c in param_cols)
+        return (f"score={row['score']:+.3f}  sharpe={row['sharpe']:+.2f}  "
+                f"wf={row['wf_consistency']:.0%}  |  {params_str}")
+
+    labels = [_row_label(r) for _, r in sorted_df.iterrows()]
+    picked_label = st.selectbox("Configuration to evaluate", labels, key="bayes_pick")
+    picked_idx = labels.index(picked_label)
+    picked_row = sorted_df.iloc[picked_idx]
+
+    if st.button("Evaluate on out-of-sample", type="primary", key="bayes_oos_btn"):
+        # Coerce types based on spec (same as grid sweep)
+        type_map = {p.name: p.type for p in (spec.params or [])}
+        picked_params = {}
+        for c in param_cols:
+            raw = picked_row[c]
+            t = type_map.get(c)
+            if t == "int":
+                picked_params[c] = int(raw)
+            elif t == "bool":
+                picked_params[c] = bool(raw)
+            else:
+                picked_params[c] = float(raw)
+        with st.spinner("Running OOS evaluation..."):
+            try:
+                factory = factory_for_params(picked_params)
+                oos_result, oos_metrics = evaluate_oos(
+                    data, factory, oos_fraction=oos_fraction,
+                    warmup_bars=warmup_bars, bars_per_year=bpy,
+                )
+                st.session_state["bayes_oos_eval"] = (oos_result, oos_metrics, picked_params)
+            except Exception as e:
+                st.error(f"OOS evaluation failed: {e}")
+
+    if st.session_state.get("bayes_oos_eval"):
+        oos_result, oos_metrics, oos_params = st.session_state["bayes_oos_eval"]
+        st.divider()
+        st.subheader("OOS verdict (final)")
+        st.caption(f"Params evaluated: `{oos_params}`")
+        metrics_panel(oos_metrics, label="Out-of-sample")
+        if not oos_result.trades_df.empty:
+            st.plotly_chart(
+                equity_chart(oos_result.equity_curve, price=data["Close"],
+                             trades_df=oos_result.trades_df, title="OOS equity curve"),
+                width="stretch",
+            )

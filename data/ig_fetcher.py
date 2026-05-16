@@ -246,6 +246,16 @@ def _ig_to_ohlcv(raw: pd.DataFrame) -> pd.DataFrame:
             out["Volume"] = raw["Volume"]
         else:
             out["Volume"] = 0.0
+
+        # Spread per bar = average of (ask - bid) across O/H/L/C points.
+        # This captures intra-bar spread variation (wider during opens/closes/news)
+        # better than a single end-of-bar snapshot. The engine uses this per-trade
+        # instead of the flat config.spread_points when present.
+        ask_avg = (raw[("ask", "Open")] + raw[("ask", "High")]
+                   + raw[("ask", "Low")] + raw[("ask", "Close")]) / 4
+        bid_avg = (raw[("bid", "Open")] + raw[("bid", "High")]
+                   + raw[("bid", "Low")] + raw[("bid", "Close")]) / 4
+        out["Spread"] = (ask_avg - bid_avg).clip(lower=0.0)
     else:
         # Already flat — just ensure column casing
         out = raw.rename(columns={

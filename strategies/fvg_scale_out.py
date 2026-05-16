@@ -190,6 +190,35 @@ class FvgScaleOut:
             trailing_stop_fn=trailing,
         )
 
+    def proposed_direction(self, history: pd.DataFrame) -> str:
+        """For ensemble polling — same FVG-retouch detection as FvgRetest."""
+        i = len(history) - 1
+        if i < 2:
+            return "none"
+        bar = history.iloc[i]
+        bar_low, bar_high = float(bar["Low"]), float(bar["High"])
+        best: FVG | None = None
+        for j in range(max(2, i - self.max_age_bars), i + 1):
+            fvg = detect_fvg(history, j)
+            if fvg is None:
+                continue
+            if not (self.min_gap_points <= fvg.size_points <= self.max_gap_points):
+                continue
+            after = history.iloc[fvg.creator_bar_index + 1: i + 1]
+            if fvg.direction == "bullish":
+                if not after.empty and bool((after["Low"] <= fvg.zone_low).any()):
+                    continue
+            else:
+                if not after.empty and bool((after["High"] >= fvg.zone_high).any()):
+                    continue
+            if not fvg.is_touched_by(bar_low, bar_high):
+                continue
+            if best is None or fvg.creator_bar_index > best.creator_bar_index:
+                best = fvg
+        if best is None:
+            return "none"
+        return "long" if best.direction == "bullish" else "short"
+
     def post_open(self, position: OpenPosition) -> None:
         """
         Called by external code when a new position has been opened.

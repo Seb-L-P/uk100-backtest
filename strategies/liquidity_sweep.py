@@ -113,3 +113,18 @@ class LiquiditySweep:
                           reason=f"sweep_low@{swing_low:.1f}, pierce={swing_low - bar_low:.1f}pts")
 
         return Signal(action="noop")
+
+    def proposed_direction(self, history: pd.DataFrame) -> str:
+        """For ensemble polling."""
+        i = len(history) - 1
+        if i < self.swing_lookback:
+            return "none"
+        bar = history.iloc[i]
+        bar_high, bar_low, bar_close = float(bar["High"]), float(bar["Low"]), float(bar["Close"])
+        swing_high = trailing_swing(history, i, self.swing_lookback, "high")
+        swing_low = trailing_swing(history, i, self.swing_lookback, "low")
+        if (bar_high > swing_high + self.sweep_min_pts) and (bar_close < swing_high):
+            return "short"
+        if (bar_low < swing_low - self.sweep_min_pts) and (bar_close > swing_low):
+            return "long"
+        return "none"

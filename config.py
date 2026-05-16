@@ -33,7 +33,15 @@ class CostModel:
     spread_points: float = 1.5            # one-way; round-trip cost = spread * stake
     sonia_annual: float = 0.0525           # current SONIA estimate
     admin_annual: float = 0.025            # IG admin component (commonly cited 2.5%)
-    slippage_points: float = 0.5           # per side, on top of spread, for stops/market orders
+    slippage_points: float = 0.5           # FALLBACK fixed slippage when spread is unknown
+                                            # (yfinance data). Per-side, applied on stops + market.
+    # Variable slippage model (used when bar spread is known, e.g. IG data):
+    #   slippage = max(min_slippage_points, slip_spread_multiplier × bar_spread)
+    # Rationale: in reality stops slip proportionally to the current bid/ask
+    # spread, which itself widens around news, opens, closes, and high volatility.
+    # A 0.5× multiplier reflects "you typically slip ~half a spread past your stop."
+    min_slippage_points: float = 0.2       # floor: even in calm markets, stops slip a bit
+    slip_spread_multiplier: float = 0.5    # fraction of current spread incurred as slippage
     guaranteed_stop_premium_pts: float = 3.0  # only applied if strategy uses guaranteed stops
 
     @property
@@ -51,6 +59,19 @@ class CostModel:
         """Daily financing charge in GBP. Positive = cost, negative = credit."""
         rate = self.long_funding_annual if is_long else -self.short_funding_annual
         return notional_gbp * rate * days / 365.0
+
+    def effective_slippage_pts(self, bar_spread: float | None) -> float:
+        """
+        Slippage in points, given the current bar's bid/ask spread.
+
+        If `bar_spread` is known (IG data), scales slippage with spread:
+            slippage = max(min_slippage_points, slip_spread_multiplier × spread)
+        Otherwise (yfinance data), falls back to the fixed `slippage_points`.
+        """
+        if bar_spread is None or bar_spread <= 0:
+            return self.slippage_points
+        return max(self.min_slippage_points,
+                   self.slip_spread_multiplier * bar_spread)
 
 
 # --- Account / risk defaults --------------------------------------------

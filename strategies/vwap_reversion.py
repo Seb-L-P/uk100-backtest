@@ -120,3 +120,18 @@ class VwapReversion:
                           reason=f"VWAP stretch {stretch:.1f}pts")
 
         return Signal(action="noop")
+
+    def proposed_direction(self, history: pd.DataFrame) -> str:
+        """For ensemble polling."""
+        if len(history) < self.atr_period + 1:
+            return "none"
+        cur_close = float(history["Close"].iloc[-1])
+        cur_vwap = float(vwap_indicator(history).iloc[-1])
+        if pd.isna(cur_vwap):
+            return "none"
+        stretch = cur_close - cur_vwap
+        if stretch > self.entry_stretch_pts:
+            return "short"
+        if -stretch > self.entry_stretch_pts:
+            return "long"
+        return "none"
