@@ -59,6 +59,12 @@ def fetch(
         return fetch_ig(ticker=ticker, interval=interval,
                         num_points=ig_num_points, use_cache=use_cache)
 
+    if source == "eodhd":
+        from data.eodhd_fetcher import fetch_eodhd
+        # Reuses the ig_num_points slider — same "bars to fetch" semantics
+        return fetch_eodhd(ticker=ticker, interval=interval,
+                           num_points=ig_num_points, use_cache=use_cache)
+
     end = end or dt.date.today().isoformat()
     start = start or _default_start_for(interval)
 

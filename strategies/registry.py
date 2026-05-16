@@ -28,6 +28,12 @@ from strategies.vwap_reversion import VwapReversion
 from strategies.rsi_reversion import RsiReversion
 from strategies.fvg_scale_out import FvgScaleOut
 from strategies.mtf_trend_fvg import MtfTrendFvg
+from strategies.macd_crossover import MacdCrossover
+from strategies.stoch_crossover import StochasticCrossover
+from strategies.engulfing import EngulfingReversal
+from strategies.inside_bar import InsideBarBreakout
+from strategies.heikin_ashi_trend import HeikinAshiTrend
+from strategies.triple_ema import TripleEma
 from strategies.ensemble import VoteEnsemble, FilterEnsemble
 
 
@@ -338,6 +344,128 @@ STRATEGIES: dict[str, StrategySpec] = {
                       default=50.0, min=40.0, max=60.0, step=1.0),
             ParamSpec("atr_period", "ATR period", "int",
                       default=14, min=5, max=50, step=1),
+            ParamSpec("atr_stop_mult", "ATR stop multiplier", "float",
+                      default=2.0, min=0.5, max=5.0, step=0.25),
+        ],
+    ),
+
+    # ---- New strategies (Phase 14) -------------------------------------
+    "macd_cross": StrategySpec(
+        key="macd_cross",
+        label="MACD signal-line crossover",
+        cls=MacdCrossover,
+        warmup_bars=30,
+        description=(
+            "Classic momentum: long when MACD line crosses above signal "
+            "line, short on cross-down. ATR-based stops, reversal on opposite signal."
+        ),
+        params=[
+            ParamSpec("fast", "MACD fast EMA", "int", default=12, min=3, max=30, step=1),
+            ParamSpec("slow", "MACD slow EMA", "int", default=26, min=10, max=60, step=1),
+            ParamSpec("signal", "MACD signal EMA", "int", default=9, min=3, max=20, step=1),
+            ParamSpec("atr_period", "ATR period", "int", default=14, min=5, max=50, step=1),
+            ParamSpec("atr_stop_mult", "ATR stop multiplier", "float",
+                      default=2.0, min=0.5, max=5.0, step=0.25),
+        ],
+    ),
+    "stoch_cross": StrategySpec(
+        key="stoch_cross",
+        label="Stochastic %K x %D",
+        cls=StochasticCrossover,
+        warmup_bars=25,
+        description=(
+            "Oscillator strategy: long when %K crosses %D inside the oversold "
+            "zone, short when crossing in overbought zone. ATR-based stops."
+        ),
+        params=[
+            ParamSpec("k_period", "%K period", "int", default=14, min=5, max=30, step=1),
+            ParamSpec("d_period", "%D period", "int", default=3, min=1, max=10, step=1),
+            ParamSpec("smooth_k", "Smooth %K", "int", default=3, min=1, max=10, step=1),
+            ParamSpec("oversold", "Oversold threshold", "float",
+                      default=30.0, min=10.0, max=40.0, step=1.0),
+            ParamSpec("overbought", "Overbought threshold", "float",
+                      default=70.0, min=60.0, max=90.0, step=1.0),
+            ParamSpec("atr_period", "ATR period", "int", default=14, min=5, max=50, step=1),
+            ParamSpec("atr_stop_mult", "ATR stop multiplier", "float",
+                      default=2.0, min=0.5, max=5.0, step=0.25),
+        ],
+    ),
+    "engulfing": StrategySpec(
+        key="engulfing",
+        label="Engulfing reversal pattern",
+        cls=EngulfingReversal,
+        warmup_bars=25,
+        description=(
+            "Take entries on bullish/bearish engulfing candles. Optional "
+            "trend-context filter ensures we're trading reversals (against "
+            "a recent EMA-slope) not continuations."
+        ),
+        params=[
+            ParamSpec("trend_ema_period", "Trend EMA period", "int",
+                      default=20, min=5, max=100, step=1),
+            ParamSpec("min_body_pts", "Min engulfing body (pts)", "float",
+                      default=5.0, min=1.0, max=50.0, step=0.5),
+            ParamSpec("r_target", "Target (R)", "float",
+                      default=2.0, min=0.5, max=5.0, step=0.25),
+            ParamSpec("stop_buffer_pts", "Stop buffer (pts)", "float",
+                      default=1.0, min=0.0, max=10.0, step=0.5),
+            ParamSpec("require_trend_context", "Require opposite-trend context", "bool",
+                      default=True),
+        ],
+    ),
+    "inside_bar": StrategySpec(
+        key="inside_bar",
+        label="Inside-bar breakout",
+        cls=InsideBarBreakout,
+        warmup_bars=20,
+        description=(
+            "Place pending STOP orders at the high and low of any inside bar. "
+            "Whichever fills first wins; the other is cancelled. ATR-based "
+            "stop + 2R target. Captures range-break momentum."
+        ),
+        params=[
+            ParamSpec("atr_period", "ATR period", "int", default=14, min=5, max=50, step=1),
+            ParamSpec("atr_stop_mult", "ATR stop multiplier", "float",
+                      default=1.5, min=0.5, max=5.0, step=0.25),
+            ParamSpec("r_target", "Target (R)", "float",
+                      default=2.0, min=0.5, max=5.0, step=0.25),
+            ParamSpec("min_inside_range_pts", "Min inside-bar range (pts)", "float",
+                      default=3.0, min=0.5, max=20.0, step=0.5),
+            ParamSpec("max_age_bars", "Max order age (bars)", "int",
+                      default=5, min=1, max=30, step=1),
+        ],
+    ),
+    "ha_trend": StrategySpec(
+        key="ha_trend",
+        label="Heikin Ashi trend follower",
+        cls=HeikinAshiTrend,
+        warmup_bars=20,
+        description=(
+            "Enter when N consecutive Heikin Ashi candles are the same colour. "
+            "Exit when HA candle colour flips. Higher N = stricter trend filter."
+        ),
+        params=[
+            ParamSpec("consecutive_bars", "Consecutive HA bars", "int",
+                      default=3, min=2, max=10, step=1),
+            ParamSpec("atr_period", "ATR period", "int", default=14, min=5, max=50, step=1),
+            ParamSpec("atr_stop_mult", "ATR stop multiplier", "float",
+                      default=2.0, min=0.5, max=5.0, step=0.25),
+        ],
+    ),
+    "triple_ema": StrategySpec(
+        key="triple_ema",
+        label="Triple EMA stack",
+        cls=TripleEma,
+        warmup_bars=55,
+        description=(
+            "Long when EMAs are stacked up (fast > mid > slow). Short when "
+            "stacked down. Exit when stack breaks. Filter for trending markets."
+        ),
+        params=[
+            ParamSpec("fast", "Fast EMA", "int", default=9, min=3, max=30, step=1),
+            ParamSpec("mid", "Mid EMA", "int", default=21, min=10, max=60, step=1),
+            ParamSpec("slow", "Slow EMA", "int", default=50, min=20, max=200, step=5),
+            ParamSpec("atr_period", "ATR period", "int", default=14, min=5, max=50, step=1),
             ParamSpec("atr_stop_mult", "ATR stop multiplier", "float",
                       default=2.0, min=0.5, max=5.0, step=0.25),
         ],

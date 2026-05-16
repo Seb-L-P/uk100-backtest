@@ -12,3 +12,4 @@ scipy>=1.10.0
 trading-ig>=0.0.20
 python-dotenv>=1.0.0
 optuna>=3.4.0
+streamlit-lightweight-charts>=0.7.0

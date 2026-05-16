@@ -24,6 +24,250 @@ import pandas as pd
 Direction = Literal["bullish", "bearish"]
 
 
+# ---- Stochastic Oscillator ---------------------------------------------
+def stochastic(df: pd.DataFrame, k_period: int = 14, d_period: int = 3,
+               smooth_k: int = 3):
+    """
+    Stochastic Oscillator: %K and %D.
+
+    %K_raw = 100 × (close - lowest_low) / (highest_high - lowest_low)  over k_period
+    %K = SMA(%K_raw, smooth_k)  — typically 3
+    %D = SMA(%K, d_period)      — typically 3
+
+    Values 0-100. Below 20 = oversold; above 80 = overbought.
+    Returns (%K, %D).
+    """
+    lowest = df["Low"].rolling(k_period).min()
+    highest = df["High"].rolling(k_period).max()
+    raw_k = 100 * (df["Close"] - lowest) / (highest - lowest).replace(0, np.nan)
+    k = raw_k.rolling(smooth_k).mean()
+    d = k.rolling(d_period).mean()
+    return k.fillna(50.0), d.fillna(50.0)
+
+
+# ---- ADX + Directional Indicators --------------------------------------
+def adx(df: pd.DataFrame, period: int = 14):
+    """
+    Average Directional Index. Returns (ADX, +DI, -DI).
+
+    ADX measures TREND STRENGTH (0-100, higher = stronger trend) regardless
+    of direction. +DI > -DI = upward momentum; -DI > +DI = downward.
+    Common interpretation: ADX > 25 = trending; ADX < 20 = ranging.
+    """
+    high, low, close = df["High"], df["Low"], df["Close"]
+    plus_dm = high.diff().clip(lower=0)
+    minus_dm = (-low.diff()).clip(lower=0)
+    # When both up- and down-moves on same bar, the smaller one is zeroed
+    plus_dm[plus_dm <= minus_dm] = 0
+    minus_dm[minus_dm <= plus_dm.shift(0)] = 0
+
+    tr = pd.concat([
+        high - low,
+        (high - close.shift(1)).abs(),
+        (low - close.shift(1)).abs(),
+    ], axis=1).max(axis=1)
+
+    # Wilder's smoothing
+    alpha = 1.0 / period
+    atr_s = tr.ewm(alpha=alpha, adjust=False).mean()
+    plus_di = 100 * plus_dm.ewm(alpha=alpha, adjust=False).mean() / atr_s.replace(0, np.nan)
+    minus_di = 100 * minus_dm.ewm(alpha=alpha, adjust=False).mean() / atr_s.replace(0, np.nan)
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    adx_line = dx.ewm(alpha=alpha, adjust=False).mean()
+    return adx_line.fillna(0.0), plus_di.fillna(0.0), minus_di.fillna(0.0)
+
+
+# ---- Williams %R --------------------------------------------------------
+def williams_r(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """
+    Williams %R — momentum oscillator, -100 to 0. Like RSI but on a different
+    scale. Above -20 = overbought; below -80 = oversold.
+
+    %R = -100 × (highest_high - close) / (highest_high - lowest_low) over period
+    """
+    highest = df["High"].rolling(period).max()
+    lowest = df["Low"].rolling(period).min()
+    wr = -100 * (highest - df["Close"]) / (highest - lowest).replace(0, np.nan)
+    return wr.fillna(-50.0)
+
+
+# ---- On-Balance Volume --------------------------------------------------
+def obv(df: pd.DataFrame) -> pd.Series:
+    """
+    On-Balance Volume — cumulative volume signed by close direction.
+
+    OBV[t] = OBV[t-1] + Volume[t]  if Close[t] > Close[t-1]
+             OBV[t-1] - Volume[t]  if Close[t] < Close[t-1]
+             OBV[t-1]              if unchanged
+
+    Trend confirmation: rising OBV during rising price = healthy trend.
+    Divergence (price up, OBV flat/down) = potential reversal.
+    """
+    if "Volume" not in df.columns:
+        return pd.Series(0.0, index=df.index)
+    direction = np.sign(df["Close"].diff().fillna(0))
+    return (direction * df["Volume"]).cumsum()
+
+
+# ---- Rate of Change (ROC) ----------------------------------------------
+def roc(series: pd.Series, period: int = 12) -> pd.Series:
+    """
+    Rate of Change as a percentage. ROC = (price - price[period ago]) / price[period ago] × 100.
+    Pure momentum, positive = uptrending, negative = downtrending.
+    """
+    return (series / series.shift(period) - 1.0) * 100
+
+
+# ---- Keltner Channels --------------------------------------------------
+def keltner_channels(df: pd.DataFrame, ema_period: int = 20,
+                     atr_period: int = 10, mult: float = 2.0):
+    """
+    Keltner Channels: like Bollinger Bands but the bands are centred on EMA
+    and width is a multiple of ATR (not standard deviation).
+
+    Returns (middle, upper, lower).
+    Touches of the bands signal volatility extremes; less prone to "expanding
+    BB during consolidation" issue because it doesn't use std.
+    """
+    middle = ema(df["Close"], ema_period)
+    atr_val = atr(df, atr_period)
+    upper = middle + mult * atr_val
+    lower = middle - mult * atr_val
+    return middle, upper, lower
+
+
+# ---- Money Flow Index --------------------------------------------------
+def mfi(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """
+    Money Flow Index — like RSI but volume-weighted. 0-100.
+    Below 20 = oversold; above 80 = overbought.
+
+    typical_price = (H+L+C)/3; money_flow = typical_price × volume
+    Positive flow = days where typical_price rose; negative flow = fell.
+    MFI = 100 - 100 / (1 + sum(positive_flow) / sum(negative_flow))
+    """
+    if "Volume" not in df.columns:
+        return pd.Series(50.0, index=df.index)
+    tp = (df["High"] + df["Low"] + df["Close"]) / 3
+    mf = tp * df["Volume"].fillna(0)
+    tp_diff = tp.diff()
+    pos_flow = mf.where(tp_diff > 0, 0.0)
+    neg_flow = mf.where(tp_diff < 0, 0.0)
+    pos_sum = pos_flow.rolling(period).sum()
+    neg_sum = neg_flow.rolling(period).sum()
+    mr = pos_sum / neg_sum.replace(0, np.nan)
+    out = 100 - 100 / (1 + mr)
+    # When neg_sum is 0:
+    #   if pos_sum > 0  → MFI = 100 (all positive flow, max overbought)
+    #   if pos_sum == 0 → MFI = 50  (truly flat)
+    out = out.mask((neg_sum == 0) & (pos_sum > 0), 100.0)
+    out = out.mask((neg_sum == 0) & (pos_sum == 0), 50.0)
+    return out.fillna(50.0)
+
+
+# ---- Parabolic SAR -----------------------------------------------------
+def parabolic_sar(df: pd.DataFrame, af_start: float = 0.02,
+                  af_step: float = 0.02, af_max: float = 0.2) -> pd.Series:
+    """
+    Parabolic SAR — trailing-stop / trend-reversal indicator.
+
+    SAR sits below price in uptrends, above in downtrends, accelerating toward
+    price each bar. When price crosses SAR, the trend "flips". Useful as a
+    trailing stop level or trend filter.
+    """
+    high, low = df["High"].to_numpy(), df["Low"].to_numpy()
+    n = len(df)
+    sar = np.zeros(n)
+    if n < 2:
+        return pd.Series(sar, index=df.index)
+
+    # Initialise: assume uptrend at bar 0
+    bull = True
+    sar[0] = low[0]
+    ep = high[0]   # extreme point
+    af = af_start
+
+    for i in range(1, n):
+        prev_sar = sar[i - 1]
+        if bull:
+            sar[i] = prev_sar + af * (ep - prev_sar)
+            sar[i] = min(sar[i], low[i - 1], low[max(0, i - 2)])
+            if low[i] < sar[i]:
+                # Reversal: trend flips to bear
+                bull = False
+                sar[i] = ep
+                ep = low[i]
+                af = af_start
+            else:
+                if high[i] > ep:
+                    ep = high[i]
+                    af = min(af_max, af + af_step)
+        else:
+            sar[i] = prev_sar - af * (prev_sar - ep)
+            sar[i] = max(sar[i], high[i - 1], high[max(0, i - 2)])
+            if high[i] > sar[i]:
+                bull = True
+                sar[i] = ep
+                ep = high[i]
+                af = af_start
+            else:
+                if low[i] < ep:
+                    ep = low[i]
+                    af = min(af_max, af + af_step)
+    return pd.Series(sar, index=df.index)
+
+
+# ---- Heikin Ashi candles -----------------------------------------------
+def heikin_ashi(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Convert OHLC to Heikin Ashi candles — smoothed view of trend.
+
+    HA_Close = (O + H + L + C) / 4
+    HA_Open  = (prev_HA_Open + prev_HA_Close) / 2
+    HA_High  = max(H, HA_Open, HA_Close)
+    HA_Low   = min(L, HA_Open, HA_Close)
+
+    A run of green HA candles indicates a sustained uptrend (and vice versa).
+    Useful as a trend filter (e.g. "only trade long when last 3 HA bars green").
+    """
+    ha_close = (df["Open"] + df["High"] + df["Low"] + df["Close"]) / 4.0
+    ha_open = pd.Series(index=df.index, dtype=float)
+    ha_open.iloc[0] = (df["Open"].iloc[0] + df["Close"].iloc[0]) / 2.0
+    for i in range(1, len(df)):
+        ha_open.iloc[i] = (ha_open.iloc[i - 1] + ha_close.iloc[i - 1]) / 2.0
+    ha_high = pd.concat([df["High"], ha_open, ha_close], axis=1).max(axis=1)
+    ha_low = pd.concat([df["Low"], ha_open, ha_close], axis=1).min(axis=1)
+    return pd.DataFrame({
+        "HA_Open": ha_open, "HA_High": ha_high,
+        "HA_Low": ha_low, "HA_Close": ha_close,
+    })
+
+
+# ---- Classic Pivot Points (daily) --------------------------------------
+def pivot_points_classic(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Classic floor-trader Pivot Points — daily levels derived from yesterday's
+    H/L/C. Returns a DataFrame with columns: P, R1, R2, R3, S1, S2, S3,
+    indexed by date.
+
+    Each level acts as potential support/resistance for the next session.
+    """
+    daily = df.resample("1D", label="left", closed="left").agg({
+        "High": "max", "Low": "min", "Close": "last",
+    }).dropna()
+    # Prev session's HLC drives today's pivots
+    prev = daily.shift(1)
+    p = (prev["High"] + prev["Low"] + prev["Close"]) / 3.0
+    r1 = 2 * p - prev["Low"]
+    s1 = 2 * p - prev["High"]
+    r2 = p + (prev["High"] - prev["Low"])
+    s2 = p - (prev["High"] - prev["Low"])
+    r3 = prev["High"] + 2 * (p - prev["Low"])
+    s3 = prev["Low"] - 2 * (prev["High"] - p)
+    return pd.DataFrame({"P": p, "R1": r1, "R2": r2, "R3": r3,
+                         "S1": s1, "S2": s2, "S3": s3}).dropna()
+
+
 # ---- Multi-timeframe resampling ---------------------------------------
 # pandas frequency aliases that our intervals map to.
 _RESAMPLE_RULE = {
