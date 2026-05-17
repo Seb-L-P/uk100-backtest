@@ -74,16 +74,48 @@ def test_at_least_one_strategy_proposes_signal(synth_data):
     assert any_signal, "No strategy proposed any direction on synth data"
 
 
-def test_ensemble_no_longer_uses_mock_broker(synth_data):
+def test_graph_with_fvg_children_does_not_crash(synth_data):
     """
-    Regression check: ensembles should NOT crash on FVG-based children
-    after the proposed_direction refactor — the bug that prompted this work.
+    Regression check: the decision-graph framework (which replaced the old
+    vote/filter ensembles) must NOT crash when FVG-based strategies appear
+    as supporters or vetoes — that was the bug that originally motivated
+    the proposed_direction refactor (the MockBroker leaked into FVG
+    strategies and crashed on `broker.pending_orders`).
+
+    Now FVG/MTF strategies sit in supporters/vetoes via proposed_direction
+    only, which is stateless w.r.t. the broker.
     """
     from backtest.engine import run_backtest
+    from backtest.graph import (
+        DecisionGraph, TriggerNode, SupporterNode, VetoNode,
+        GraphOrchestrator,
+    )
 
-    for ensemble_key in ("vote_meanrev", "vote_trend", "filter_fvg_rsi"):
-        spec = reg.get(ensemble_key)
-        ensemble = spec.build(**spec.defaults())
-        # Should run without AttributeError on pending_orders
-        result = run_backtest(synth_data, ensemble, warmup_bars=spec.warmup_bars)
+    # Mirror the three old ensembles as graphs:
+    graphs = [
+        # vote_meanrev ≈ trigger bb_revert + supporters rsi_revert + vwap_revert
+        DecisionGraph(
+            trigger=TriggerNode("bb_revert", {}, "15m"),
+            supporters=[
+                SupporterNode("rsi_revert", {}, "15m"),
+                SupporterNode("vwap_revert", {}, "15m"),
+            ],
+            min_score=0.0,
+        ),
+        # vote_trend ≈ trigger donchian + supporter sma
+        DecisionGraph(
+            trigger=TriggerNode("donchian", {}, "15m"),
+            supporters=[SupporterNode("sma", {}, "15m")],
+            min_score=0.0,
+        ),
+        # filter_fvg_rsi ≈ trigger fvg + veto rsi_revert
+        # The original regression: FVG as a member of an ensemble.
+        DecisionGraph(
+            trigger=TriggerNode("fvg", {}, "15m"),
+            vetoes=[VetoNode("rsi_revert", {}, "15m")],
+            min_score=0.0,
+        ),
+    ]
+    for g in graphs:
+        result = run_backtest(synth_data, GraphOrchestrator(g), warmup_bars=50)
         assert result.bars_processed == len(synth_data)

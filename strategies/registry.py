@@ -34,7 +34,9 @@ from strategies.engulfing import EngulfingReversal
 from strategies.inside_bar import InsideBarBreakout
 from strategies.heikin_ashi_trend import HeikinAshiTrend
 from strategies.triple_ema import TripleEma
-from strategies.ensemble import VoteEnsemble, FilterEnsemble
+# ensemble.py is no longer used by the registry; the decision-graph
+# framework supersedes it. Tests may still import from strategies.ensemble
+# directly, which continues to work.
 
 
 ParamType = Literal["int", "float", "bool"]
@@ -495,81 +497,13 @@ STRATEGIES: dict[str, StrategySpec] = {
         ],
     ),
 
-    # ---- ENSEMBLES ------------------------------------------------------
-    # Combination strategies. Each preset has fixed children; only the
-    # ensemble-level params (vote threshold, R-target, ATR-stop) are tunable.
-    # Once you've validated that the basic ensembles work, custom combinations
-    # can be added by mirroring the factory pattern below.
-    "vote_meanrev": StrategySpec(
-        key="vote_meanrev",
-        label="Vote: mean-revert (BB+RSI+VWAP)",
-        factory=lambda **p: VoteEnsemble(
-            children=[BollingerReversion(), RsiReversion(), VwapReversion()],
-            **p,
-        ),
-        warmup_bars=25,
-        description=(
-            "Three mean-reversion children vote. By default trades when at least 2 "
-            "of the 3 (BB / RSI / VWAP) agree on direction. Ensemble's own ATR stop + R-target."
-        ),
-        params=[
-            ParamSpec("min_agreement", "Min strategies agreeing", "int",
-                      default=2, min=1, max=3, step=1,
-                      help="2 = majority; 3 = unanimous."),
-            ParamSpec("r_target", "Target (R)", "float",
-                      default=2.0, min=0.5, max=5.0, step=0.25),
-            ParamSpec("stop_atr_mult", "Stop ATR multiplier", "float",
-                      default=2.0, min=0.5, max=5.0, step=0.25),
-            ParamSpec("atr_period", "ATR period", "int",
-                      default=14, min=5, max=50, step=1),
-        ],
-    ),
-    "vote_trend": StrategySpec(
-        key="vote_trend",
-        label="Vote: trend (Donchian+SMA)",
-        factory=lambda **p: VoteEnsemble(
-            children=[DonchianBreakout(), SmaCrossover()],
-            **p,
-        ),
-        warmup_bars=55,
-        description=(
-            "Two trend-following children vote. Both must agree by default. "
-            "Designed as a counterpoint to vote_meanrev — completely different regime."
-        ),
-        params=[
-            ParamSpec("min_agreement", "Min strategies agreeing", "int",
-                      default=2, min=1, max=2, step=1),
-            ParamSpec("r_target", "Target (R)", "float",
-                      default=2.5, min=0.5, max=5.0, step=0.25),
-            ParamSpec("stop_atr_mult", "Stop ATR multiplier", "float",
-                      default=2.0, min=0.5, max=5.0, step=0.25),
-            ParamSpec("atr_period", "ATR period", "int",
-                      default=14, min=5, max=50, step=1),
-        ],
-    ),
-    "filter_fvg_rsi": StrategySpec(
-        key="filter_fvg_rsi",
-        label="FVG filtered by RSI",
-        factory=lambda **p: FilterEnsemble(
-            trigger=FvgRetest(),
-            filters=[RsiReversion()],
-            **p,
-        ),
-        warmup_bars=25,
-        description=(
-            "FVG retest is the trigger; only takes the trade if RSI strategy doesn't "
-            "veto (i.e. RSI isn't screaming the opposite direction). Example of "
-            "trigger + filter pattern: keep the core idea, add a quality screen."
-        ),
-        params=[
-            ParamSpec("r_target", "Target (R)", "float",
-                      default=2.0, min=0.5, max=5.0, step=0.25),
-            ParamSpec("stop_atr_mult", "Stop ATR multiplier", "float",
-                      default=2.0, min=0.5, max=5.0, step=0.25),
-            ParamSpec("atr_period", "ATR period", "int",
-                      default=14, min=5, max=50, step=1),
-        ],
-    ),
+    # ---- ENSEMBLES (removed) -------------------------------------------
+    # The old vote/filter ensemble entries have been replaced by the
+    # decision-graph framework in backtest/graph.py. To replicate them:
+    #   - vote_meanrev = trigger:bb_revert + supporters:[rsi_revert, vwap_revert]
+    #   - vote_trend   = trigger:donchian + supporter:sma
+    #   - filter_fvg_rsi = trigger:fvg + veto:rsi_revert
+    # Build any of these via the graph builder UI and save as a preset.
 }
 
 

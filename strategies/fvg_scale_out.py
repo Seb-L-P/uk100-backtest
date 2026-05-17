@@ -140,7 +140,10 @@ class FvgScaleOut:
         if broker.positions:  # already in a trade — don't stack FVGs
             return Signal(action="noop")
 
-        # ---- Entry: any unfilled FVG retested by this bar ----
+        # ---- Entry: place a LIMIT order at the FVG's near edge ------------
+        # The limit fills only when price actually retraces to the FVG zone,
+        # so stop (far edge + buffer) is GUARANTEED on the loss side of entry.
+        # Same fix as FvgRetest — geometry bug otherwise.
         candidates = [
             f for f in self._open_fvgs
             if f.creator_bar_index < i and f.is_touched_by(bar_low, bar_high)
@@ -149,29 +152,27 @@ class FvgScaleOut:
             return Signal(action="noop")
         fvg = max(candidates, key=lambda f: f.creator_bar_index)
 
+        from strategies._helpers import atr_threshold
+        stop_buf = atr_threshold(history, self.stop_buffer_atr_mult, self.atr_period)
         if fvg.direction == "bullish":
             entry = fvg.near_edge
-            from strategies._helpers import atr_threshold
-            stop_buf = atr_threshold(history, self.stop_buffer_atr_mult, self.atr_period)
             stop = fvg.far_edge - stop_buf
             risk = entry - stop
-            action = "open_long"
+            side = "long"
         else:
             entry = fvg.near_edge
-            from strategies._helpers import atr_threshold
-            stop_buf = atr_threshold(history, self.stop_buffer_atr_mult, self.atr_period)
             stop = fvg.far_edge + stop_buf
             risk = stop - entry
-            action = "open_short"
+            side = "short"
 
         if risk <= 0:
             return Signal(action="noop")
 
         stake = risk_based_stake(broker.balance, risk, price=entry)
+        if stake <= 0:
+            return Signal(action="noop")
 
         # Compose trailing: breakeven after 1R, then ATR trail on the runner.
-        # Note: scale-out itself triggers via the strategy's on_bar logic above,
-        # but the breakeven in the trailing fn is a redundant safety net.
         trailing = combine(
             breakeven_after_R(risk_pts=risk, move_to_R=1.0, plus_pts=0.5),
             atr_trailing(history, atr_period=self.trail_atr_period,
@@ -183,21 +184,21 @@ class FvgScaleOut:
         except ValueError:
             pass
 
-        # Record entry risk on the next bar — we don't have the position id
-        # yet (broker assigns it). We use a side-channel by tagging via the
-        # strategy: the engine creates the position with this stake/risk, and
-        # we look up risk by position id on subsequent bars. We capture risk
-        # via a closure on the next-bar signal callback... actually simpler:
-        # store the planned risk by entry price + time, then look up after.
+        # Risk lookup for the scale-out logic remains the same — pending order
+        # records the planned risk so when it fills, we know what 1R is.
         self._pending_entry_risk = risk
 
-        return Signal(
-            action=action,
-            stake_per_point=stake,
-            stop_loss=stop,
-            take_profit=None,  # no fixed target — exits via scale + trail + stop
-            reason=f"{fvg.direction}_fvg_size={fvg.size_points:.1f}pts",
+        broker.place_pending_order(
+            side=side, order_type="limit",
+            trigger_price=entry, stake_per_point=stake,
+            time=history.index[i],
+            stop_loss=stop, take_profit=None,
             trailing_stop_fn=trailing,
+            expires_after_bars=self.max_age_bars,
+        )
+        return Signal(
+            action="noop",
+            reason=f"{fvg.direction}_fvg_size={fvg.size_points:.1f}pts (limit armed)",
         )
 
     def proposed_direction(self, history: pd.DataFrame) -> str:

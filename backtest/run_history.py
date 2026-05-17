@@ -27,7 +27,11 @@ from config import PROJECT_ROOT
 DEFAULT_DB_PATH = PROJECT_ROOT / "run_history.db"
 
 
-SCHEMA = """
+# NOTE: schema is applied in three stages so existing DBs can migrate
+# safely. CREATE TABLE IF NOT EXISTS is a no-op on existing tables, which
+# means any new columns or indices touching those columns must be applied
+# via the migration step below, not via the original DDL.
+TABLE_DDL = """
 CREATE TABLE IF NOT EXISTS runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp TEXT NOT NULL,
@@ -56,13 +60,43 @@ CREATE TABLE IF NOT EXISTS runs (
     total_slippage_cost REAL,
     total_financing_cost REAL,
     metrics_json TEXT,
-    notes TEXT
+    notes TEXT,
+    preset_name TEXT,
+    graph_json TEXT
 );
+"""
 
+# Indices that touch columns existing in the very first version of the
+# schema. Safe to run unconditionally.
+LEGACY_INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_runs_strategy ON runs(strategy_key);
 CREATE INDEX IF NOT EXISTS idx_runs_timestamp ON runs(timestamp);
 CREATE INDEX IF NOT EXISTS idx_runs_sharpe ON runs(sharpe);
 """
+
+# Indices on columns added by migrations. MUST run AFTER _maybe_add_columns.
+MIGRATED_INDEXES = """
+CREATE INDEX IF NOT EXISTS idx_runs_preset ON runs(preset_name);
+"""
+
+# Kept for backwards-compat with any external code that imports SCHEMA.
+SCHEMA = TABLE_DDL + LEGACY_INDEXES
+
+
+def _maybe_add_columns(conn) -> None:
+    """
+    SQLite doesn't apply CREATE TABLE changes to an existing table, so we
+    add new columns on existing DBs in-place. Idempotent: silently skips
+    columns that already exist.
+    """
+    cur = conn.execute("PRAGMA table_info(runs)")
+    existing = {row[1] for row in cur.fetchall()}
+    for col, ddl in [
+        ("preset_name", "ALTER TABLE runs ADD COLUMN preset_name TEXT"),
+        ("graph_json", "ALTER TABLE runs ADD COLUMN graph_json TEXT"),
+    ]:
+        if col not in existing:
+            conn.execute(ddl)
 
 
 @contextmanager
@@ -71,7 +105,15 @@ def _conn(db_path: Path = DEFAULT_DB_PATH):
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     try:
-        conn.executescript(SCHEMA)
+        # 1. Ensure base table + legacy indices. CREATE TABLE IF NOT EXISTS is
+        #    a no-op on already-existing tables, so older DBs keep their old
+        #    column set at this point.
+        conn.executescript(TABLE_DDL)
+        conn.executescript(LEGACY_INDEXES)
+        # 2. Add any columns missing on the existing table (in-place migration).
+        _maybe_add_columns(conn)
+        # 3. NOW it's safe to create indices that reference migrated columns.
+        conn.executescript(MIGRATED_INDEXES)
         yield conn
         conn.commit()
     finally:
@@ -95,9 +137,16 @@ def save_run(
     result,        # BacktestResult
     metrics,       # Metrics
     notes: str = "",
+    preset_name: str | None = None,
+    graph_dict: dict | None = None,
     db_path: Path = DEFAULT_DB_PATH,
 ) -> int:
-    """Persist one run. Returns the new row's id."""
+    """Persist one run. Returns the new row's id.
+
+    `preset_name` and `graph_dict` link a row to the decision graph that
+    produced it. Ad-hoc runs (no preset) pass None for both; the row will
+    show preset_name = NULL in list_runs.
+    """
     m = asdict(metrics) if is_dataclass(metrics) else dict(metrics)
     period_start = (str(result.equity_curve.index[0])
                     if len(result.equity_curve) else "")
@@ -126,6 +175,8 @@ def save_run(
         m.get("total_financing_cost"),
         json.dumps(m, default=str),
         notes,
+        preset_name,
+        json.dumps(graph_dict, default=str) if graph_dict is not None else None,
     )
     with _conn(db_path) as conn:
         cur = conn.execute("""
@@ -135,12 +186,30 @@ def save_run(
                 final_balance, total_return_pct, sharpe, sortino, profit_factor,
                 max_drawdown_pct, num_trades, win_rate_pct, expectancy_r, cagr_pct,
                 total_gross_pnl, total_spread_cost, total_slippage_cost, total_financing_cost,
-                metrics_json, notes
+                metrics_json, notes, preset_name, graph_json
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                      ?, ?, ?, ?, ?, ?)
+                      ?, ?, ?, ?, ?, ?, ?, ?)
         """, row)
         return cur.lastrowid
+
+
+def runs_for_preset(preset_name: str,
+                     limit: int = 200,
+                     db_path: Path = DEFAULT_DB_PATH) -> list[dict]:
+    """All runs linked to a given preset, most-recent first."""
+    sql = """
+        SELECT id, timestamp, strategy_key, strategy_label, ticker, interval,
+               source, mode, num_trades, total_return_pct, sharpe, profit_factor,
+               max_drawdown_pct, params_json, notes, preset_name
+        FROM runs
+        WHERE preset_name = ?
+        ORDER BY timestamp DESC
+        LIMIT ?
+    """
+    with _conn(db_path) as conn:
+        cur = conn.execute(sql, (preset_name, limit))
+        return [dict(row) for row in cur.fetchall()]
 
 
 def list_runs(

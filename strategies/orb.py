@@ -65,6 +65,11 @@ class OpeningRangeBreakout:
         self._or_high = None
         self._or_low = None
         self._traded_today = False
+        # IDs of the buy-stop + sell-stop orders armed once the OR closes.
+        # First-fill-wins: when one triggers, the other is cancelled.
+        self._stop_up_id: str | None = None
+        self._stop_dn_id: str | None = None
+        self._stops_armed = False
 
     def on_bar(self, history: pd.DataFrame, broker: Broker) -> Signal:
         i = len(history) - 1
@@ -79,57 +84,89 @@ class OpeningRangeBreakout:
 
         self._day_bars_seen += 1
 
-        # Force-flat near end of day
-        if broker.position is not None and now >= self.flat_by:
-            return Signal(action="close", reason="session_end")
+        # Force-flat near end of day: cancel pending OR-break orders + close
+        if now >= self.flat_by:
+            for oid in (self._stop_up_id, self._stop_dn_id):
+                if oid is not None:
+                    broker.cancel_pending_order(oid)
+            self._stop_up_id = self._stop_dn_id = None
+            if broker.position is not None:
+                return Signal(action="close", reason="session_end")
 
-        # Skip if outside session, or already traded today, or already in a position
+        # Outside session / already traded → nothing to do
         if not in_session(now, self.session_open, self.session_close):
             return Signal(action="noop")
-        if broker.position is not None:
+        if broker.position is not None or self._traded_today:
             return Signal(action="noop")
-        if self._traded_today:
-            return Signal(action="noop")
+
+        # First-fill-wins: if one of our pending stops filled and is no longer
+        # in the broker's pending list, cancel its sibling so we don't open
+        # the opposite trade later.
+        live = {o.id for o in broker.pending_orders}
+        if self._stops_armed:
+            up_dead = self._stop_up_id is not None and self._stop_up_id not in live
+            dn_dead = self._stop_dn_id is not None and self._stop_dn_id not in live
+            if up_dead and self._stop_dn_id in live:
+                broker.cancel_pending_order(self._stop_dn_id)
+                self._stop_dn_id = None
+                self._traded_today = True
+            elif dn_dead and self._stop_up_id in live:
+                broker.cancel_pending_order(self._stop_up_id)
+                self._stop_up_id = None
+                self._traded_today = True
 
         # Build the opening range as the first N bars
         if self._day_bars_seen <= self.opening_range_bars:
-            # Track the running high/low across the OR window
             high_so_far = float(bar["High"])
             low_so_far = float(bar["Low"])
             self._or_high = high_so_far if self._or_high is None else max(self._or_high, high_so_far)
             self._or_low = low_so_far if self._or_low is None else min(self._or_low, low_so_far)
             return Signal(action="noop")
 
-        # OR window is closed; look for a break
+        # OR closed — arm two STOP orders the first time we reach this point.
+        # Fill price = trigger price, so stop/target geometry is preserved.
+        if self._stops_armed:
+            return Signal(action="noop")
         if self._or_high is None or self._or_low is None:
             return Signal(action="noop")
 
         from strategies._helpers import atr_threshold
         stop_buffer = atr_threshold(history, self.stop_buffer_atr_mult, self.atr_period)
-        close = float(bar["Close"])
-        if close > self._or_high:
-            # Bullish breakout
-            entry = close
-            stop = self._or_low - stop_buffer
-            risk = entry - stop
-            target = entry + self.r_target * risk
-            stake = risk_based_stake(broker.balance, risk, price=entry)
-            self._traded_today = True
-            return Signal(action="open_long", stake_per_point=stake,
-                          stop_loss=stop, take_profit=target,
-                          reason=f"ORB up: OR={self._or_low:.1f}-{self._or_high:.1f}")
-        if close < self._or_low:
-            entry = close
-            stop = self._or_high + stop_buffer
-            risk = stop - entry
-            target = entry - self.r_target * risk
-            stake = risk_based_stake(broker.balance, risk, price=entry)
-            self._traded_today = True
-            return Signal(action="open_short", stake_per_point=stake,
-                          stop_loss=stop, take_profit=target,
-                          reason=f"ORB down: OR={self._or_low:.1f}-{self._or_high:.1f}")
 
-        return Signal(action="noop")
+        # Bullish stop-buy at OR high
+        entry_up = self._or_high
+        stop_up = self._or_low - stop_buffer
+        risk_up = entry_up - stop_up
+        target_up = entry_up + self.r_target * risk_up
+        stake_up = risk_based_stake(broker.balance, risk_up, price=entry_up)
+
+        # Bearish stop-sell at OR low
+        entry_dn = self._or_low
+        stop_dn = self._or_high + stop_buffer
+        risk_dn = stop_dn - entry_dn
+        target_dn = entry_dn - self.r_target * risk_dn
+        stake_dn = risk_based_stake(broker.balance, risk_dn, price=entry_dn)
+
+        if risk_up <= 0 or risk_dn <= 0 or stake_up <= 0 or stake_dn <= 0:
+            return Signal(action="noop")
+
+        order_up = broker.place_pending_order(
+            side="long", order_type="stop",
+            trigger_price=entry_up, stake_per_point=stake_up,
+            time=ts, stop_loss=stop_up, take_profit=target_up,
+            expires_after_bars=None,  # cancelled at flat_by
+        )
+        order_dn = broker.place_pending_order(
+            side="short", order_type="stop",
+            trigger_price=entry_dn, stake_per_point=stake_dn,
+            time=ts, stop_loss=stop_dn, take_profit=target_dn,
+            expires_after_bars=None,
+        )
+        self._stop_up_id = order_up.id
+        self._stop_dn_id = order_dn.id
+        self._stops_armed = True
+        return Signal(action="noop",
+                      reason=f"ORB stops armed: range={self._or_low:.1f}-{self._or_high:.1f}")
 
     def proposed_direction(self, history: pd.DataFrame) -> str:
         """

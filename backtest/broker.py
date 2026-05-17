@@ -56,6 +56,8 @@ class PendingOrder:
     trailing_stop_fn: Callable | None = None
     expires_after_bars: int | None = None
     bars_alive: int = 0
+    # Free-form metadata to carry through the fill (confluence score, etc.)
+    entry_metadata: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -85,6 +87,9 @@ class Trade:
     # None if the strategy didn't specify one.
     planned_stop_loss: float | None = None
     planned_take_profit: float | None = None
+    # Free-form metadata captured at entry (e.g. confluence_score,
+    # supporters breakdown from the decision-graph orchestrator).
+    entry_metadata: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -113,6 +118,10 @@ class OpenPosition:
     # When set, used (combined with the exit bar's spread) to compute the
     # round-trip spread cost. None → falls back to the active cost profile.
     entry_spread_pts: float | None = None
+    # Free-form metadata captured at entry time. The decision-graph
+    # orchestrator stuffs the trade's confluence score + per-supporter
+    # breakdown here so it can be analysed post-run.
+    entry_metadata: dict = field(default_factory=dict)
 
 
 class Broker:
@@ -157,6 +166,10 @@ class Broker:
         # Number of pending orders that couldn't fill (leverage cap, max
         # positions). Surfaced in the metrics panel so the user knows.
         self._dropped_order_count = 0
+        # Number of market-order entries skipped because the next bar's open
+        # invalidated the strategy's stop/target geometry. Surfaced too so
+        # the user can tell if a strategy is bleeding signals to gaps.
+        self._dropped_geometry_count = 0
 
     # ---- Backward-compat: single-position view ------------------------
     @property
@@ -191,7 +204,49 @@ class Broker:
         take_profit: float | None = None,
         trailing_stop_fn: Callable | None = None,
         entry_spread_pts: float | None = None,
+        entry_metadata: dict | None = None,
     ) -> OpenPosition:
+        # ---- Stop / target geometry guard --------------------------------
+        # Refuses to open a position with an invalid stop/target layout —
+        # i.e. a stop on the PROFIT side, or a target on the LOSS side.
+        # See docs on _dropped_geometry_count for the two causes:
+        #   1. Strategy-bug class (BPR pre-fix): stop locked to a static
+        #      level chosen many bars ago; market fill lands past it.
+        #   2. Gap class (BB/VWAP reversion): stop is ATR-relative but the
+        #      next bar gaps past it.
+        # For (1) the fix is to use a limit/stop pending order.
+        # For (2) the right move is to SKIP the trade — the setup is gone.
+        # Skipping vs raising is the caller's choice: the engine's
+        # `_apply_signal` pre-checks and skips silently for market orders.
+        # Pending fills still hit this and raise, because their fill price
+        # equals the trigger price — a violation there means the strategy
+        # set up the order wrong (a real bug we want to surface).
+        if stop_loss is not None:
+            if side == "long" and stop_loss >= price:
+                raise ValueError(
+                    f"Invalid stop geometry: LONG entry at {price:.4f} with "
+                    f"stop_loss={stop_loss:.4f} (must be below entry). "
+                    f"For pending limit/stop fills this is a real strategy "
+                    f"bug. For market-order fills, this can happen on a "
+                    f"gap — use Engine._apply_signal's pre-check to skip."
+                )
+            if side == "short" and stop_loss <= price:
+                raise ValueError(
+                    f"Invalid stop geometry: SHORT entry at {price:.4f} with "
+                    f"stop_loss={stop_loss:.4f} (must be above entry)."
+                )
+        if take_profit is not None:
+            if side == "long" and take_profit <= price:
+                raise ValueError(
+                    f"Invalid target geometry: LONG entry at {price:.4f} with "
+                    f"take_profit={take_profit:.4f} (must be above entry)."
+                )
+            if side == "short" and take_profit >= price:
+                raise ValueError(
+                    f"Invalid target geometry: SHORT entry at {price:.4f} with "
+                    f"take_profit={take_profit:.4f} (must be below entry)."
+                )
+
         # Validate leverage against TOTAL notional (existing + new)
         new_notional = stake_per_point * price
         existing_notional = sum(
@@ -227,6 +282,7 @@ class Broker:
             last_funding_apply=time,
             trailing_stop_fn=trailing_stop_fn,
             entry_spread_pts=entry_spread_pts,
+            entry_metadata=entry_metadata or {},
         )
         self._next_id += 1
         self.positions.append(pos)
@@ -407,6 +463,7 @@ class Broker:
             position_id=position.id,
             planned_stop_loss=position.initial_stop_loss,
             planned_take_profit=position.initial_take_profit,
+            entry_metadata=dict(position.entry_metadata),
         )
         self.trades.append(trade)
         self.balance += net_pnl
@@ -437,6 +494,7 @@ class Broker:
         take_profit: float | None = None,
         trailing_stop_fn: Callable | None = None,
         expires_after_bars: int | None = None,
+        entry_metadata: dict | None = None,
     ) -> PendingOrder:
         """Place a limit or stop order in the order book."""
         if order_type not in ("limit", "stop"):
@@ -452,6 +510,7 @@ class Broker:
             take_profit=take_profit,
             trailing_stop_fn=trailing_stop_fn,
             expires_after_bars=expires_after_bars,
+            entry_metadata=entry_metadata or {},
         )
         self._next_order_id += 1
         self.pending_orders.append(order)
@@ -509,6 +568,7 @@ class Broker:
                     take_profit=order.take_profit,
                     trailing_stop_fn=order.trailing_stop_fn,
                     entry_spread_pts=bar_spread,
+                    entry_metadata=dict(order.entry_metadata),
                 )
                 newly_opened.append(pos)
             except (ValueError, RuntimeError) as e:

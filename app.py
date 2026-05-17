@@ -47,7 +47,9 @@ from backtest.sweep import grid_sweep, evaluate_oos
 from backtest.optuna_search import run_optuna_study
 from backtest.run_history import save_run, list_runs, delete_run, count_runs
 from strategies import registry as reg
-from strategies.ensemble import VoteEnsemble, FilterEnsemble
+# Old ensemble classes (VoteEnsemble, FilterEnsemble) are deprecated —
+# their roles are subsumed by the decision graph. Strategies are now
+# composed via app_graph_builder + backtest.graph.
 
 
 # ---- Page config -------------------------------------------------------
@@ -62,13 +64,7 @@ BARS_PER_YEAR = {
     "30m": 252 * 17, "1h": 252 * 8, "1d": 252,
 }
 
-# Strategies allowed as ensemble children — exclude existing ensembles to
-# prevent nesting (we'd need extra plumbing to make that work cleanly).
-PRESET_ENSEMBLE_KEYS = {"vote_meanrev", "vote_trend", "filter_fvg_rsi"}
-CHILD_CANDIDATES = {k: v for k, v in reg.STRATEGIES.items()
-                    if k not in PRESET_ENSEMBLE_KEYS}
-
-N_SLOTS = 4  # how many child slots in the custom ensemble builder
+# (Ensemble-related constants removed; graph builder owns strategy composition.)
 
 
 # ---- Cached data fetch -------------------------------------------------
@@ -82,13 +78,6 @@ def cached_fetch(ticker: str, interval: str,
 # ---- Sidebar: setup ----------------------------------------------------
 with st.sidebar:
     st.header("Setup")
-
-    # Top-level: registry mode vs custom ensemble mode
-    build_mode = st.radio(
-        "Strategy source",
-        ["Pick from registry", "Build custom ensemble"],
-        horizontal=False,
-    )
 
     data_source = st.radio(
         "Data source",
@@ -220,196 +209,48 @@ with st.sidebar:
     is_optuna_mode = mode == "Bayesian sweep"
     is_search_mode = is_grid_mode or is_optuna_mode
 
-    # Custom ensemble + search modes are not supported (factory composition is
-    # too tangled to safely sweep over). Force registry mode in that combination.
-    if is_search_mode and build_mode == "Build custom ensemble":
-        st.warning("Custom ensembles can't be swept (yet). Switch to "
-                   "'Pick from registry' for sweep / Bayesian / adaptive WF.")
-        build_mode = "Pick from registry"
+    # ---- Decision graph builder ---------------------------------------
+    # The graph replaces the old "Pick from registry" / "Custom ensemble"
+    # / "HTF filter" trio. Single-strategy backtests are the degenerate
+    # case: trigger only, no supporters, no vetoes.
+    from app_graph_builder import graph_builder_ui
+    from backtest.graph import GraphOrchestrator
+    from backtest.presets import graph_to_dict
 
-    # ---- Branch A: Registry mode ---------------------------------------
-    if build_mode == "Pick from registry":
-        strategy_keys = list(reg.STRATEGIES.keys())
-        strategy_labels = [reg.STRATEGIES[k].label for k in strategy_keys]
-        selected_label = st.selectbox("Strategy", strategy_labels, index=0)
-        strategy_key = strategy_keys[strategy_labels.index(selected_label)]
-        spec = reg.get(strategy_key)
+    graph, _gb = graph_builder_ui(
+        interval=interval, is_grid=is_grid_mode, is_optuna=is_optuna_mode,
+    )
+    strategy_key = graph.trigger.strategy_key
+    spec = reg.get(strategy_key)
+    param_values = dict(graph.trigger.params)
+    param_grid = _gb["param_grid"]
+    display_label = _gb["display_label"]
+    display_desc = _gb["display_desc"]
+    warmup_bars = _gb["warmup_bars"]
+    strategy_factory = lambda g=graph: GraphOrchestrator(g)
 
-        st.caption(spec.description)
-
-        param_values: dict[str, Any] = {}
-        param_grid: dict[str, list] = {}
-
-        if is_optuna_mode:
-            st.subheader("Strategy parameters")
-            st.caption(
-                f"Optuna will search the param ranges defined in the registry "
-                f"({len(spec.params or [])} params). No manual grid needed."
-            )
-        elif is_grid_mode:
-            st.subheader("Parameter grid")
-            st.caption("Comma-separated values per param. One value = fixed.")
-            for p in (spec.params or []):
-                default_str = str(p.default)
-                txt = st.text_input(
-                    p.label, value=default_str,
-                    help=f"Type: {p.type}. Default: {p.default}. "
-                         f"Example: '3, 5, 7'. {p.help or ''}",
-                    key=f"grid_{strategy_key}_{p.name}",
-                )
-                try:
-                    items = [x.strip() for x in txt.split(",") if x.strip()]
-                    if p.type == "int":
-                        param_grid[p.name] = [int(x) for x in items]
-                    elif p.type == "float":
-                        param_grid[p.name] = [float(x) for x in items]
-                    elif p.type == "bool":
-                        param_grid[p.name] = [x.lower() in ("1", "true", "yes", "y")
-                                              for x in items]
-                    if not param_grid[p.name]:
-                        param_grid[p.name] = [p.default]
-                except ValueError as e:
-                    st.error(f"Bad value for '{p.label}': {e}. Using default.")
-                    param_grid[p.name] = [p.default]
-        else:
-            st.subheader("Strategy parameters")
-            for p in (spec.params or []):
-                if p.type == "int":
-                    param_values[p.name] = st.slider(
-                        p.label, int(p.min), int(p.max), int(p.default),
-                        step=int(p.step) if p.step else 1,
-                        help=p.help,
-                    )
-                elif p.type == "float":
-                    param_values[p.name] = st.slider(
-                        p.label, float(p.min), float(p.max), float(p.default),
-                        step=float(p.step) if p.step else 0.1,
-                        help=p.help,
-                    )
-                elif p.type == "bool":
-                    param_values[p.name] = st.checkbox(p.label, value=bool(p.default), help=p.help)
-
-        display_label = spec.label
-        display_desc = spec.description
-        warmup_bars = spec.warmup_bars
-        strategy_factory = lambda: spec.build(**param_values)
-        # Factory builder used by sweep / adaptive WF
-        def factory_for_params(params: dict):
-            full = {**spec.defaults(), **params}
-            return lambda: spec.build(**full)
-
-    # ---- Branch B: Custom ensemble builder -----------------------------
-    else:
-        st.subheader("Pick children")
-        st.caption(f"Up to {N_SLOTS} strategies. Empty slots are ignored. Children use their default params.")
-
-        child_keys_options = list(CHILD_CANDIDATES.keys())
-        child_label_options = ["(none)"] + [CHILD_CANDIDATES[k].label for k in child_keys_options]
-        # parallel list with None for the (none) slot
-        child_key_lookup = [None] + child_keys_options
-
-        selected_child_keys: list[str] = []
-        for slot in range(N_SLOTS):
-            choice_label = st.selectbox(
-                f"Slot {slot + 1}", child_label_options,
-                index=0, key=f"child_slot_{slot}",
-            )
-            choice_idx = child_label_options.index(choice_label)
-            chosen_key = child_key_lookup[choice_idx]
-            if chosen_key is not None and chosen_key not in selected_child_keys:
-                selected_child_keys.append(chosen_key)
-
-        st.subheader("Combination type")
-        ensemble_type = st.radio(
-            "Type", ["Vote (M-of-N agreement)", "Filter (trigger + filters)"],
-            help=("Vote: trade when M children agree on direction. "
-                  "Filter: first-selected slot is the trigger; the rest can veto."),
+    # Sweep/adaptive: build factories that vary the TRIGGER's params,
+    # keeping supporters/vetoes/weights/min_score fixed (those knobs are
+    # never sweepable — see graph.py docstring).
+    def factory_for_params(params: dict, _g=graph, _spec=spec):
+        from backtest.graph import (
+            DecisionGraph as _DG, TriggerNode as _TN
         )
-
-        n_selected = len(selected_child_keys)
-
-        if ensemble_type.startswith("Vote"):
-            # Slider needs min < max; when 0 or 1 children selected, just fix at 1
-            if n_selected <= 1:
-                min_agreement = 1
-                st.caption(f"Min strategies agreeing: **1** (only "
-                           f"{n_selected} selected — slider disabled)")
-            else:
-                min_agreement = st.slider(
-                    "Min strategies agreeing",
-                    min_value=1, max_value=n_selected,
-                    value=min(2, n_selected), step=1,
-                )
-        else:
-            min_agreement = None
-            if n_selected >= 1:
-                trigger_label = st.selectbox(
-                    "Trigger (others act as filters)",
-                    [CHILD_CANDIDATES[k].label for k in selected_child_keys],
-                    index=0,
-                )
-            else:
-                trigger_label = None
-
-        st.subheader("Ensemble parameters")
-        r_target = st.slider("Target (R)", 0.5, 5.0, 2.0, 0.25)
-        stop_atr_mult = st.slider("Stop ATR multiplier", 0.5, 5.0, 2.0, 0.25)
-        atr_period = st.slider("ATR period", 5, 50, 14, 1)
-
-        # Validate selection
-        if n_selected == 0:
-            st.warning("Pick at least one strategy in slot 1.")
-            valid = False
-        elif ensemble_type.startswith("Filter") and n_selected < 2:
-            st.warning("Filter mode needs at least 2 strategies (1 trigger + 1+ filters). "
-                       "If you only want one strategy, use Vote with min_agreement=1.")
-            valid = False
-        else:
-            valid = True
-
-        # Build factory
-        if valid:
-            child_keys_snapshot = list(selected_child_keys)
-            etype_snapshot = ensemble_type
-
-            def custom_factory():
-                # Each call creates fresh children (matters for walk-forward folds)
-                children = [
-                    CHILD_CANDIDATES[k].build(**CHILD_CANDIDATES[k].defaults())
-                    for k in child_keys_snapshot
-                ]
-                if etype_snapshot.startswith("Vote"):
-                    return VoteEnsemble(
-                        children=children,
-                        min_agreement=min_agreement,
-                        r_target=r_target,
-                        stop_atr_mult=stop_atr_mult,
-                        atr_period=atr_period,
-                    )
-                # Filter mode
-                trig_idx = [CHILD_CANDIDATES[k].label for k in child_keys_snapshot].index(trigger_label)
-                trigger = children[trig_idx]
-                filters = [c for i, c in enumerate(children) if i != trig_idx]
-                return FilterEnsemble(
-                    trigger=trigger,
-                    filters=filters,
-                    r_target=r_target,
-                    stop_atr_mult=stop_atr_mult,
-                    atr_period=atr_period,
-                )
-
-            strategy_factory = custom_factory
-            warmup_bars = max(CHILD_CANDIDATES[k].warmup_bars for k in child_keys_snapshot)
-            display_label = f"Custom ensemble ({len(child_keys_snapshot)} strategies)"
-            display_desc = (
-                f"{ensemble_type} of: " +
-                ", ".join(CHILD_CANDIDATES[k].label for k in child_keys_snapshot)
-            )
-        else:
-            strategy_factory = None
-            warmup_bars = 50
-            display_label = "Custom ensemble (incomplete)"
-            display_desc = "Pick at least one valid set of children to run."
+        full = {**_spec.defaults(), **params}
+        new_g = _DG(
+            trigger=_TN(strategy_key=_g.trigger.strategy_key,
+                        params=full,
+                        timeframe=_g.trigger.timeframe),
+            supporters=list(_g.supporters),
+            vetoes=list(_g.vetoes),
+            min_score=_g.min_score,
+            risk_floor=_g.risk_floor,
+            risk_ceiling=_g.risk_ceiling,
+            risk_curve=_g.risk_curve,
+            tf_alpha=_g.tf_alpha,
+            preset_name=_g.preset_name,
+        )
+        return lambda gg=new_g: GraphOrchestrator(gg)
 
     st.divider()
     run_clicked = st.button("Run backtest", type="primary", width="stretch",
@@ -460,10 +301,43 @@ has_cached_single = (mode == "Single backtest"
 has_cached_bayes = (mode == "Bayesian sweep"
                     and st.session_state.get("bayes_result") is not None)
 
+def _wipe_history_db():
+    """
+    Drop and recreate the runs table — clean-slate when the schema has
+    shifted underneath an old DB or you just want a fresh start.
+    """
+    import sqlite3
+    from backtest.run_history import DEFAULT_DB_PATH, init_db
+    try:
+        with sqlite3.connect(str(DEFAULT_DB_PATH)) as c:
+            c.execute("DROP TABLE IF EXISTS runs")
+            for idx in ("idx_runs_strategy", "idx_runs_timestamp",
+                        "idx_runs_sharpe", "idx_runs_preset"):
+                c.execute(f"DROP INDEX IF EXISTS {idx}")
+    except sqlite3.OperationalError:
+        # If the file is locked, fall back to nuking it from disk.
+        from pathlib import Path
+        try:
+            Path(DEFAULT_DB_PATH).unlink(missing_ok=True)
+        except Exception:
+            pass
+    init_db()
+
+
 def _render_run_history():
     """Show recent runs from the SQLite history. Filterable, deletable."""
     n_runs = count_runs()
     with st.expander(f"📜 Run history ({n_runs} saved)", expanded=False):
+        # Top-right wipe control — keep this OUT of the conditional below so
+        # users can clear a corrupt/legacy DB even when count_runs returns 0.
+        col_wipe_a, col_wipe_b = st.columns([3, 1])
+        with col_wipe_b:
+            if st.button("Wipe all history", key="wipe_history_btn",
+                         help="Drop the runs table and start fresh. "
+                              "Useful after schema changes."):
+                _wipe_history_db()
+                st.success("Run history cleared.")
+                st.rerun()
         if n_runs == 0:
             st.caption("No runs saved yet. Run a backtest and it'll appear here.")
             return
@@ -1107,7 +981,7 @@ if mode == "Single backtest":
     # tweaks to widgets below (trade picker, indicator overlays, etc.) don't
     # re-trigger a full backtest.
     if st.session_state.get("single_result") is not None:
-        result, m = st.session_state["single_result"]
+        result, m, _filter_stats = st.session_state["single_result"]
     else:
         progress_slot = st.empty()
         bar = progress_slot.progress(0, text=f"Running backtest over {len(data):,} bars…")
@@ -1115,13 +989,25 @@ if mode == "Single backtest":
             pct = int(frac * 100)
             bar.progress(min(pct, 99),
                          text=f"Running backtest… {pct}% ({len(data):,} bars)")
-        result = run_backtest(data, strategy_factory(),
+        # Capture the strategy instance so we can read HTF filter counters
+        # after the run completes.
+        _strategy_inst = strategy_factory()
+        result = run_backtest(data, _strategy_inst,
                               warmup_bars=warmup_bars,
                               progress_callback=_update_progress)
         bar.progress(100, text=f"Computing metrics… ({len(result.trades_df)} trades)")
         m = compute_metrics(result, bars_per_year=bpy)
         progress_slot.empty()
-        st.session_state["single_result"] = (result, m)
+        _scores_list = getattr(_strategy_inst, "scores", []) or []
+        _avg = (sum(_scores_list) / len(_scores_list)) if _scores_list else float("nan")
+        _filter_stats = {
+            "attempted": getattr(_strategy_inst, "attempted", 0),
+            "blocked_veto": getattr(_strategy_inst, "blocked_veto", 0),
+            "blocked_score": getattr(_strategy_inst, "blocked_score", 0),
+            "avg_score": _avg,
+            "scores": _scores_list,
+        }
+        st.session_state["single_result"] = (result, m, _filter_stats)
 
         # Auto-save to run history (only on the FRESH compute path,
         # not on cached re-renders)
@@ -1135,11 +1021,46 @@ if mode == "Single backtest":
                 source=_active_source,
                 mode="single",
                 result=result, metrics=m,
+                preset_name=graph.preset_name,
+                graph_dict=graph_to_dict(graph, graph.preset_name or "ad-hoc"),
             )
         except Exception as e:
             st.caption(f"⚠️ Run not saved to history: {e}")
 
     metrics_panel(m, label="Results")
+    # Surface decision-graph stats so the user can judge whether the
+    # supporters / vetoes are too aggressive and whether the score is
+    # correlating with edge.
+    _att = _filter_stats.get("attempted", 0)
+    _blk_v = _filter_stats.get("blocked_veto", 0)
+    _blk_s = _filter_stats.get("blocked_score", 0)
+    _blk = _blk_v + _blk_s
+    _scores = _filter_stats.get("scores", []) or []
+    if _att > 0:
+        _avg = _filter_stats.get("avg_score", float("nan"))
+        _pass_rate = (_att - _blk) / _att * 100 if _att else 0
+        cols = st.columns(4)
+        cols[0].metric("Entries attempted", _att)
+        cols[1].metric("Blocked (veto + score)", _blk,
+                       delta=f"{_blk_v} veto / {_blk_s} score")
+        cols[2].metric("Pass rate", f"{_pass_rate:.0f}%")
+        cols[3].metric("Avg confluence score",
+                       f"{_avg:.2f}" if not pd.isna(_avg) else "n/a")
+        # Score histogram
+        if len(_scores) >= 10:
+            with st.expander("Confluence score distribution"):
+                fig_h = go.Figure()
+                fig_h.add_trace(go.Histogram(
+                    x=_scores, nbinsx=20,
+                    marker_color="steelblue",
+                    name="Score",
+                ))
+                fig_h.update_layout(
+                    title="Confluence score per entry attempt",
+                    xaxis_title="Score", yaxis_title="Count",
+                    height=280, margin=dict(l=10, r=10, t=40, b=10),
+                )
+                st.plotly_chart(fig_h, width="stretch")
     cost_audit_panel(result, last_price=float(data["Close"].iloc[-1]),
                      profile=active_cost)
     st.plotly_chart(

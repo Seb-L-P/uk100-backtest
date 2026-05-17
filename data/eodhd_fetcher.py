@@ -73,13 +73,22 @@ def _load_api_key() -> str:
 #
 # If you upgrade to a plan that includes indices, change the value to
 # "UKX.INDX" — the cash index data IS more accurate to what IG quotes.
-EPIC_MAP = {
-    "^FTSE": "ISF.LSE",
-    "FTSE": "ISF.LSE",
-    "UKX": "ISF.LSE",         # the official FTSE 100 ticker — but EODHD
-                               # routes it to the ETF proxy on this plan tier
-    "UK100": "ISF.LSE",
-    "FTSE100": "ISF.LSE",
+# Each mapping is (EODHD symbol, price_scale_factor). When the user asks for
+# UK100 (which gets routed to the ISF.LSE proxy quoted in PENCE), the data
+# is scaled up by 10× so it sits at the same price level as the real FTSE
+# 100 cash index. That way the UK100 cost profile (1.5pt spread = ~2 bps
+# at 8000) actually represents 2 bps of friction, not 19 bps.
+#
+# Without the scale factor, applying a fixed 1.5pt spread to an 800-priced
+# ETF over-charges friction by 10× and structurally guarantees a losing
+# backtest regardless of strategy quality. Confirmed bug — Apr 2026.
+EPIC_MAP: dict[str, tuple[str, float]] = {
+    "^FTSE":   ("ISF.LSE", 10.0),
+    "FTSE":    ("ISF.LSE", 10.0),
+    "UKX":     ("ISF.LSE", 10.0),  # official FTSE 100 ticker, but EODHD
+                                    # routes it to the ETF proxy on this plan
+    "UK100":   ("ISF.LSE", 10.0),
+    "FTSE100": ("ISF.LSE", 10.0),
 }
 
 # Map our interval shortcuts to EODHD's native intraday intervals.
@@ -96,15 +105,21 @@ EODHD_NATIVE_INTERVAL = {
 }
 
 
-def _to_symbol(ticker: str) -> str:
-    """Map ticker shortcut to EODHD symbol."""
-    return EPIC_MAP.get(ticker.upper(), ticker)
+def _to_symbol(ticker: str) -> tuple[str, float]:
+    """
+    Map ticker shortcut to (EODHD symbol, price_scale_factor).
+    Unknown tickers pass through verbatim with scale 1.0.
+    """
+    return EPIC_MAP.get(ticker.upper(), (ticker, 1.0))
 
 
 # ---- Cache -------------------------------------------------------------
 def _cache_path(symbol: str, interval: str, num_points: int) -> Path:
+    # `v2` prefix invalidates pre-scale-aware caches (Apr 2026). Without
+    # this, an ISF.LSE cache from before the proxy-rescale fix would be
+    # loaded as-is and silently apply the 10x-too-tight friction bug.
     safe = symbol.replace(".", "_").replace("^", "")
-    return DATA_CACHE / f"eodhd_{safe}_{interval}_{num_points}pts.parquet"
+    return DATA_CACHE / f"eodhd_v2_{safe}_{interval}_{num_points}pts.parquet"
 
 
 # ---- Date helpers ------------------------------------------------------
@@ -166,10 +181,14 @@ def fetch_eodhd(
         num_points: number of bars to fetch (working backwards from now).
         use_cache: read from parquet cache if present.
     """
-    symbol = _to_symbol(ticker)
+    symbol, price_scale = _to_symbol(ticker)
+    # Cache key includes the scale so a switched mapping doesn't poison the
+    # cached file. A separate cache file per (symbol, interval, num, scale).
     cache_file = _cache_path(symbol, interval, num_points)
     if use_cache and cache_file.exists():
-        return _validate(pd.read_parquet(cache_file))
+        df = _validate(pd.read_parquet(cache_file))
+        # Cache files store already-scaled OHLCV, so just return.
+        return df
 
     api_key = _load_api_key()
 
@@ -185,6 +204,13 @@ def fetch_eodhd(
         # Resample if user asked for a non-native interval
         if interval != native:
             df = _resample(df, interval)
+
+    # Apply the proxy → real-instrument scale factor (UK100 alias is at
+    # ISF.LSE ÷10, so scale=10 lifts prices back into FTSE-index range).
+    if price_scale != 1.0:
+        for col in ("Open", "High", "Low", "Close"):
+            if col in df.columns:
+                df[col] = df[col] * price_scale
 
     df = _validate(df)
     df.to_parquet(cache_file)

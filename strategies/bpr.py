@@ -99,6 +99,9 @@ class BalancedPriceRange:
         self._fvgs: list[FVG] = []
         self._bprs: list[BPR] = []
         self._last_processed_index = -1
+        # Maps BPR.creator_bar_index → pending order id, so we don't double-arm
+        # the same zone and can cancel cleanly on staleness / flat_by.
+        self._bpr_to_order_id: dict[int, str] = {}
 
     def on_bar(self, history: pd.DataFrame, broker: Broker) -> Signal:
         from strategies._helpers import atr_threshold
@@ -143,59 +146,90 @@ class BalancedPriceRange:
             self._bprs = [b for b in self._bprs
                           if (i - b.creator_bar_index) <= self.max_bpr_age]
 
-        # Force-flat
-        if broker.position is not None and now >= self.flat_by:
-            return Signal(action="close", reason="session_end")
+        # ---- Sync our order-tracking map with broker's live pending orders ----
+        # An order that's filled / expired / been cancelled is no longer in
+        # broker.pending_orders. Drop those id mappings so we can re-arm a
+        # BPR later if its order died without filling.
+        live_order_ids = {o.id for o in broker.pending_orders}
+        self._bpr_to_order_id = {
+            k: v for k, v in self._bpr_to_order_id.items() if v in live_order_ids
+        }
+
+        # ---- First-fill-wins: cancel other BPR orders once a position opens
+        if broker.position is not None and self._bpr_to_order_id:
+            for oid in list(self._bpr_to_order_id.values()):
+                broker.cancel_pending_order(oid)
+            self._bpr_to_order_id.clear()
+
+        # Force-flat at session close
+        if now >= self.flat_by:
+            for oid in list(self._bpr_to_order_id.values()):
+                broker.cancel_pending_order(oid)
+            self._bpr_to_order_id.clear()
+            if broker.position is not None:
+                return Signal(action="close", reason="session_end")
         if not in_session(now, self.session_open, self.session_close):
             return Signal(action="noop")
         if broker.position is not None:
             return Signal(action="noop")
 
-        # Find a BPR being retested by this bar (must be created BEFORE this bar)
-        candidates = [b for b in self._bprs
-                      if b.creator_bar_index < i and b.is_touched_by(bar_low, bar_high)]
+        # ---- Place a LIMIT order for any new BPR retest -----------------
+        # Only consider BPRs that are being touched by this bar AND not yet
+        # armed with a pending order. The limit's fill price = the zone edge,
+        # so the stop/target geometry can't be inverted by a gap.
+        candidates = [
+            b for b in self._bprs
+            if (b.creator_bar_index < i
+                and b.is_touched_by(bar_low, bar_high)
+                and b.creator_bar_index not in self._bpr_to_order_id)
+        ]
         if not candidates:
             return Signal(action="noop")
         bpr = max(candidates, key=lambda b: b.creator_bar_index)
 
-        # Determine approach direction from last N bars
+        # Approach direction at touch moment — decides which side we trade
         if i >= self.approach_lookback:
             recent_close = history["Close"].iloc[i - self.approach_lookback]
             net_move = bar_close - recent_close
         else:
             net_move = 0
+        if net_move == 0:
+            return Signal(action="noop")
 
         if net_move < 0:
-            # Approach from above (selling into the BPR) → expect bounce → LONG
-            entry = bpr.zone_high  # near edge from above
-            stop = bpr.zone_low - atr_threshold(history, self.stop_buffer_atr_mult, self.atr_period)
+            # Approach from above → expect bounce → LIMIT BUY at zone_high
+            entry = bpr.zone_high
+            stop = bpr.zone_low - atr_threshold(
+                history, self.stop_buffer_atr_mult, self.atr_period)
             risk = entry - stop
             target = entry + self.r_target * risk
-            action = "open_long"
-        elif net_move > 0:
-            # Approach from below (rallying into BPR) → expect rejection → SHORT
+            side = "long"
+        else:
+            # Approach from below → expect rejection → LIMIT SELL at zone_low
             entry = bpr.zone_low
-            stop = bpr.zone_high + atr_threshold(history, self.stop_buffer_atr_mult, self.atr_period)
+            stop = bpr.zone_high + atr_threshold(
+                history, self.stop_buffer_atr_mult, self.atr_period)
             risk = stop - entry
             target = entry - self.r_target * risk
-            action = "open_short"
-        else:
-            return Signal(action="noop")
+            side = "short"
 
         if risk <= 0:
             return Signal(action="noop")
-
         stake = risk_based_stake(broker.balance, risk, price=entry)
+        if stake <= 0:
+            return Signal(action="noop")
 
-        # Remove this BPR (one-shot)
-        try:
-            self._bprs.remove(bpr)
-        except ValueError:
-            pass
-
-        return Signal(action=action, stake_per_point=stake,
-                      stop_loss=stop, take_profit=target,
-                      reason=f"BPR size={bpr.size_points:.1f}, approach={'down' if net_move<0 else 'up'}")
+        order = broker.place_pending_order(
+            side=side, order_type="limit",
+            trigger_price=entry, stake_per_point=stake,
+            time=history.index[i],
+            stop_loss=stop, take_profit=target,
+            expires_after_bars=self.max_bpr_age,
+        )
+        self._bpr_to_order_id[bpr.creator_bar_index] = order.id
+        return Signal(action="noop",
+                      reason=(f"BPR limit armed: size={bpr.size_points:.1f}, "
+                              f"approach={'down' if net_move<0 else 'up'}"))
 
     def proposed_direction(self, history: pd.DataFrame) -> str:
         """

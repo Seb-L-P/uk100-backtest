@@ -41,6 +41,10 @@ from strategies._helpers import risk_based_stake, in_session, trailing_swing
 
 
 class LiquiditySweep:
+    # Limit orders armed by sweeps expire after this many bars if unfilled.
+    # The setup degrades quickly once the sweep is no longer fresh.
+    LIMIT_EXPIRY_BARS = 5
+
     def __init__(
         self,
         swing_lookback: int = 20,
@@ -60,6 +64,9 @@ class LiquiditySweep:
         self.session_open = session_open
         self.session_close = session_close
         self.flat_by = flat_by
+        # We arm at most one limit per sweep event. Tracked here so we don't
+        # double-arm on the same bar and can cancel cleanly at session end.
+        self._active_order_id: str | None = None
 
     def on_bar(self, history: pd.DataFrame, broker: Broker) -> Signal:
         i = len(history) - 1
@@ -70,13 +77,23 @@ class LiquiditySweep:
         if i < self.swing_lookback:
             return Signal(action="noop")
 
-        # Force-flat near end of day
-        if broker.position is not None and now >= self.flat_by:
-            return Signal(action="close", reason="session_end")
+        # Clean up our tracker if the previous order is gone (filled/expired)
+        live_order_ids = {o.id for o in broker.pending_orders}
+        if self._active_order_id is not None and self._active_order_id not in live_order_ids:
+            self._active_order_id = None
 
+        # Force-flat at session close: cancel pending and close any position
+        if now >= self.flat_by:
+            if self._active_order_id is not None:
+                broker.cancel_pending_order(self._active_order_id)
+                self._active_order_id = None
+            if broker.position is not None:
+                return Signal(action="close", reason="session_end")
         if not in_session(now, self.session_open, self.session_close):
             return Signal(action="noop")
-        if broker.position is not None:
+        # One trade at a time; if we already have a position or pending order
+        # armed, don't stack a fresh sweep on top.
+        if broker.position is not None or self._active_order_id is not None:
             return Signal(action="noop")
 
         bar_high = float(bar["High"])
@@ -91,7 +108,10 @@ class LiquiditySweep:
         sweep_min = atr_threshold(history, self.sweep_min_atr_mult, self.atr_period)
         stop_buffer = atr_threshold(history, self.stop_buffer_atr_mult, self.atr_period)
 
-        # ---- Sweep HIGH = bearish signal -----------------------------------
+        # ---- Sweep HIGH = bearish signal: arm a LIMIT short at bar_close ----
+        # The limit fills only if price returns up to bar_close from below,
+        # so the actual fill price = bar_close — stop (= bar_high + buffer)
+        # is guaranteed to be above the fill.
         if (bar_high > swing_high + sweep_min) and (bar_close < swing_high):
             entry = bar_close
             stop = bar_high + stop_buffer
@@ -100,11 +120,20 @@ class LiquiditySweep:
                 return Signal(action="noop")
             target = entry - self.r_target * risk
             stake = risk_based_stake(broker.balance, risk, price=entry)
-            return Signal(action="open_short", stake_per_point=stake,
-                          stop_loss=stop, take_profit=target,
-                          reason=f"sweep_high@{swing_high:.1f}, pierce={bar_high - swing_high:.1f}pts")
+            if stake <= 0:
+                return Signal(action="noop")
+            order = broker.place_pending_order(
+                side="short", order_type="limit",
+                trigger_price=entry, stake_per_point=stake,
+                time=ts, stop_loss=stop, take_profit=target,
+                expires_after_bars=self.LIMIT_EXPIRY_BARS,
+            )
+            self._active_order_id = order.id
+            return Signal(action="noop",
+                          reason=f"sweep_high@{swing_high:.1f}, "
+                                 f"limit short armed @ {entry:.2f}")
 
-        # ---- Sweep LOW = bullish signal -----------------------------------
+        # ---- Sweep LOW = bullish signal: arm a LIMIT long at bar_close ----
         if (bar_low < swing_low - sweep_min) and (bar_close > swing_low):
             entry = bar_close
             stop = bar_low - stop_buffer
@@ -113,9 +142,18 @@ class LiquiditySweep:
                 return Signal(action="noop")
             target = entry + self.r_target * risk
             stake = risk_based_stake(broker.balance, risk, price=entry)
-            return Signal(action="open_long", stake_per_point=stake,
-                          stop_loss=stop, take_profit=target,
-                          reason=f"sweep_low@{swing_low:.1f}, pierce={swing_low - bar_low:.1f}pts")
+            if stake <= 0:
+                return Signal(action="noop")
+            order = broker.place_pending_order(
+                side="long", order_type="limit",
+                trigger_price=entry, stake_per_point=stake,
+                time=ts, stop_loss=stop, take_profit=target,
+                expires_after_bars=self.LIMIT_EXPIRY_BARS,
+            )
+            self._active_order_id = order.id
+            return Signal(action="noop",
+                          reason=f"sweep_low@{swing_low:.1f}, "
+                                 f"limit long armed @ {entry:.2f}")
 
         return Signal(action="noop")
 

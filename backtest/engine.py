@@ -73,6 +73,7 @@ class Signal:
         limit_price: float | None = None,
         expires_after_bars: int | None = None,
         cancel_order_id: str | None = None,
+        metadata: dict | None = None,
     ):
         self.action = action
         self.stake_per_point = stake_per_point
@@ -87,6 +88,10 @@ class Signal:
         self.limit_price = limit_price
         self.expires_after_bars = expires_after_bars
         self.cancel_order_id = cancel_order_id
+        # Free-form metadata attached at entry time (e.g. confluence score,
+        # per-supporter scores) by the GraphOrchestrator. Propagated through
+        # broker.open → OpenPosition → Trade so it's queryable in trades_df.
+        self.metadata = metadata or {}
 
 
 class Strategy(Protocol):
@@ -141,6 +146,14 @@ def run_backtest(
         from config import COSTS as _DEFAULT_COSTS
         costs = _DEFAULT_COSTS
     broker = Broker(costs=costs)
+
+    # Install a fresh MTFContext for this run. Strategies access it via
+    # `backtest.mtf.current()` to read higher-timeframe trend/EMA/RSI/etc.
+    # The context is updated every bar with the current timestamp so that
+    # HTF lookups remain look-ahead-safe.
+    from backtest.mtf import MTFContext, set_active as _mtf_set_active
+    _mtf_ctx = MTFContext(data)
+    _mtf_set_active(_mtf_ctx)
     n = len(data)
 
     # Track pending signals to execute at next bar's open
@@ -159,6 +172,10 @@ def run_backtest(
             except Exception:
                 # A failing callback should never break a backtest.
                 pass
+
+        # Update MTF as-of cursor so any strategy's `current().htf(...)` calls
+        # only see HTF bars closed before this base-TF timestamp.
+        _mtf_ctx.set_now(data.index[i])
         time = data.index[i]
         bar = data.iloc[i]
         bar_dict = {
@@ -244,6 +261,10 @@ def run_backtest(
             "Equity curve timestamps not monotonically increasing — bug in mark()."
         )
 
+    # Clear the active MTF context so subsequent operations / other runs
+    # don't accidentally inherit this run's data.
+    _mtf_set_active(None)
+
     return BacktestResult(
         trades_df=trades_df,
         equity_curve=eq,
@@ -252,6 +273,26 @@ def run_backtest(
         bars_processed=n,
         strategy_name=type(strategy).__name__,
     )
+
+
+def _gap_invalidates(side: str, fill_price: float,
+                     stop_loss: float | None,
+                     take_profit: float | None) -> bool:
+    """
+    True iff the actual fill price has moved past the strategy's stop or
+    target, so the geometry of the trade is broken. Caller should skip.
+    """
+    if stop_loss is not None:
+        if side == "long" and stop_loss >= fill_price:
+            return True
+        if side == "short" and stop_loss <= fill_price:
+            return True
+    if take_profit is not None:
+        if side == "long" and take_profit <= fill_price:
+            return True
+        if side == "short" and take_profit >= fill_price:
+            return True
+    return False
 
 
 def _apply_signal(signal: Signal, broker: Broker, time, price: float,
@@ -288,11 +329,24 @@ def _apply_signal(signal: Signal, broker: Broker, time, price: float,
                 take_profit=signal.take_profit,
                 trailing_stop_fn=signal.trailing_stop_fn,
                 expires_after_bars=signal.expires_after_bars,
+                entry_metadata=getattr(signal, "metadata", None),
             )
             return
 
         # Market order (default): close existing positions if replace_all,
         # then open immediately at the current price.
+        # --- Geometry pre-check ---
+        # The strategy set stop/target on the PREVIOUS bar's price; we're
+        # now filling at THIS bar's open. If the open gapped past the stop
+        # or target, the strategy's setup is invalidated — skip the trade
+        # rather than open a position with broken risk. The broker's
+        # geometry guard would raise on this, but for market orders we
+        # prefer to silently drop and count: the strategy didn't have a
+        # bug, the market just moved.
+        if _gap_invalidates(side, price, signal.stop_loss, signal.take_profit):
+            broker._dropped_geometry_count += 1
+            return
+
         if signal.replace_all and broker.positions:
             broker.close_all(time, price, reason="reverse",
                              exit_spread_pts=entry_spread_pts)
@@ -301,6 +355,7 @@ def _apply_signal(signal: Signal, broker: Broker, time, price: float,
             stop_loss=signal.stop_loss, take_profit=signal.take_profit,
             trailing_stop_fn=signal.trailing_stop_fn,
             entry_spread_pts=entry_spread_pts,
+            entry_metadata=getattr(signal, "metadata", None),
         )
 
     elif signal.action == "close":
@@ -361,4 +416,9 @@ def _trade_to_dict(t) -> dict:
         # Used by the trade inspector to draw target/stop zones.
         "planned_stop_loss": t.planned_stop_loss,
         "planned_take_profit": t.planned_take_profit,
+        # Decision-graph metadata: top-level fields are promoted to first-class
+        # columns; the full dict is stored in `entry_metadata` for power users.
+        "confluence_score": t.entry_metadata.get("confluence_score"),
+        "risk_multiplier": t.entry_metadata.get("risk_multiplier"),
+        "entry_metadata": t.entry_metadata,
     }
