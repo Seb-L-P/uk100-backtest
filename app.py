@@ -147,6 +147,51 @@ with st.sidebar:
     config.COSTS = PROFILES[selected_profile_name]
     active_cost = config.COSTS
 
+    # ---- Trading timezone ----
+    # Data fetched from any source is converted to this tz on load, so a
+    # strategy's `session_open=time(8,30)` always means 8:30 in YOUR clock —
+    # regardless of where the asset trades. UK 100 in Europe/London = market
+    # hours 08:00-16:30 native; TSLA in Europe/London = 14:30-21:00 (winter)
+    # / 14:30-21:00 (summer — UK and US DST roughly align).
+    _tz_options = ["Europe/London", "America/New_York", "Europe/Berlin",
+                   "Asia/Tokyo", "Asia/Hong_Kong", "UTC"]
+    selected_tz = st.selectbox(
+        "Trading timezone", _tz_options,
+        index=_tz_options.index(getattr(config, "TRADING_TZ", "Europe/London")),
+        help="All fetched data is converted to this timezone, so session "
+             "times in your strategies are interpreted in your local clock. "
+             "Default Europe/London. For TSLA in UK: session_open=14:30, "
+             "session_close=20:30, flat_by=20:55.",
+    )
+    config.TRADING_TZ = selected_tz
+
+    # ---- Data hours ----
+    # Restrict the loaded data to RTH (regular trading hours) or include
+    # extended hours. Defaults to RTH for stocks/indices, no-filter for
+    # crypto/FX. Filtering happens on fetch so charts and indicators only
+    # see what's actually tradable — no more bizarre pre-market spike bars
+    # polluting the FVG detector.
+    _data_hours_options = ["RTH (regular hours)", "Extended hours", "All available (24/7)"]
+    _data_window_default = "RTH (regular hours)"
+    # Crypto profile → default to All
+    if active_cost.instrument in ("BTC", "ETH", "EURUSD", "GBPUSD", "USDJPY"):
+        _data_window_default = "All available (24/7)"
+    data_hours_mode = st.radio(
+        "Data hours",
+        _data_hours_options,
+        index=_data_hours_options.index(_data_window_default),
+        horizontal=False,
+        help=("RTH: only bars during the asset's regular trading session "
+              "(per cost profile). Extended: includes pre/post-market. "
+              "All: no time-of-day filter, every bar the source provided. "
+              "RTH is the safe default — pre-market data on US stocks is "
+              "thin-liquidity and produces unrealistic strategy signals."),
+    )
+    # Map radio choice to a mode string for trading_window_for()
+    _mode_key = {"RTH (regular hours)": "rth",
+                 "Extended hours": "eth",
+                 "All available (24/7)": None}[data_hours_mode]
+
     interval = st.selectbox("Interval", list(BARS_PER_YEAR.keys()), index=2)
     mode = st.radio(
         "Mode",
@@ -432,7 +477,31 @@ except Exception as e:
                 "to verify your EODHD API key and plan coverage.")
     st.stop()
 
-st.write(f"**Data:** {len(data)} bars from {data.index[0]} to {data.index[-1]}")
+# ---- Data-hours filter ----
+# Drop bars outside the chosen window (RTH / Extended / None) using the
+# cost profile's session definition in the active trading TZ. We do this
+# AFTER fetch — the cache holds the full data; the filter is cheap.
+_n_before = len(data)
+if _mode_key is not None:
+    from config import trading_window_for
+    _w = trading_window_for(active_cost.instrument, _mode_key)
+    if _w is not None:
+        from backtest.graph import _parse_hhmm as _phm
+        _open_t = _phm(_w[0])
+        _close_t = _phm(_w[1])
+        if _open_t is not None and _close_t is not None:
+            _idx_times = data.index.time
+            _mask = (_idx_times >= _open_t) & (_idx_times <= _close_t)
+            data = data.loc[_mask]
+_n_filtered = _n_before - len(data)
+_filter_caption = ""
+if _n_filtered > 0:
+    _filter_caption = (f" · filtered out {_n_filtered:,} "
+                       f"{'pre/post-market' if _mode_key == 'rth' else 'out-of-window'} "
+                       f"bars (kept {len(data):,} / {_n_before:,})")
+
+st.write(f"**Data:** {len(data)} bars from {data.index[0]} to "
+         f"{data.index[-1]}{_filter_caption}")
 
 # ---- Cost transparency: show what the backtest will actually charge ----
 _last_price = float(data["Close"].iloc[-1])
@@ -1000,10 +1069,24 @@ if mode == "Single backtest":
         progress_slot.empty()
         _scores_list = getattr(_strategy_inst, "scores", []) or []
         _avg = (sum(_scores_list) / len(_scores_list)) if _scores_list else float("nan")
+        # Pull broker-side counters too so the user gets a full breakdown
+        # of "attempts vs trades": filled / expired / cancelled / rejected.
+        # Without these, "Entries attempted: 106, Trades: 41" is mystifying.
+        _broker = getattr(_strategy_inst, "_broker_ref", None)
+        # The orchestrator holds the broker via the engine's run_backtest,
+        # not as a direct ref. Pull from the result instead — bars_processed
+        # implies the engine ran, and we capture the broker's stats via the
+        # trades_df length and the dropped counters below from the engine.
         _filter_stats = {
             "attempted": getattr(_strategy_inst, "attempted", 0),
             "blocked_veto": getattr(_strategy_inst, "blocked_veto", 0),
             "blocked_score": getattr(_strategy_inst, "blocked_score", 0),
+            "blocked_late_entry": getattr(_strategy_inst, "blocked_late_entry", 0),
+            "filled": len(result.trades_df),
+            "expired": getattr(result, "_expired_order_count", 0),
+            "cancelled": getattr(result, "_cancelled_order_count", 0),
+            "rejected": getattr(result, "_dropped_order_count", 0),
+            "geom_dropped": getattr(result, "_dropped_geometry_count", 0),
             "avg_score": _avg,
             "scores": _scores_list,
         }
@@ -1034,18 +1117,61 @@ if mode == "Single backtest":
     _att = _filter_stats.get("attempted", 0)
     _blk_v = _filter_stats.get("blocked_veto", 0)
     _blk_s = _filter_stats.get("blocked_score", 0)
-    _blk = _blk_v + _blk_s
+    _blk_l = _filter_stats.get("blocked_late_entry", 0)
+    _blk = _blk_v + _blk_s + _blk_l
+    _filled = _filter_stats.get("filled", 0)
+    _expired = _filter_stats.get("expired", 0)
+    _cancelled = _filter_stats.get("cancelled", 0)
+    _rejected = _filter_stats.get("rejected", 0)
     _scores = _filter_stats.get("scores", []) or []
     if _att > 0:
         _avg = _filter_stats.get("avg_score", float("nan"))
-        _pass_rate = (_att - _blk) / _att * 100 if _att else 0
+        # Show the full flow: attempted → blocked → filled / expired /
+        # cancelled / rejected. The user kept asking why "attempts > trades"
+        # so make the destination of every attempt visible.
         cols = st.columns(4)
         cols[0].metric("Entries attempted", _att)
-        cols[1].metric("Blocked (veto + score)", _blk,
-                       delta=f"{_blk_v} veto / {_blk_s} score")
-        cols[2].metric("Pass rate", f"{_pass_rate:.0f}%")
+        cols[1].metric(
+            "Blocked (confluence)",
+            _blk,
+            delta=(f"{_blk_v} veto · {_blk_s} score"
+                   + (f" · {_blk_l} late" if _blk_l else "")),
+            help="Blocked by veto/score/late-entry-filter at placement time.",
+        )
+        cols[2].metric(
+            "Filled (= trades)", _filled,
+            delta=f"{_filled/_att*100:.0f}% of attempts" if _att else "",
+            help="Pending orders that successfully filled into actual trades.",
+        )
         cols[3].metric("Avg confluence score",
                        f"{_avg:.2f}" if not pd.isna(_avg) else "n/a")
+        # Second row: the rest of the attempts — orders that didn't make
+        # trades for non-confluence reasons.
+        _unaccounted = _att - _blk - _filled - _expired - _cancelled - _rejected
+        if any((_expired, _cancelled, _rejected)) or _unaccounted:
+            cols2 = st.columns(4)
+            cols2[0].metric(
+                "Expired", _expired,
+                help="Pending orders that aged past expires_after_bars "
+                     "without price reaching the trigger. Normal for "
+                     "FVG-style strategies."
+            )
+            cols2[1].metric(
+                "Cancelled", _cancelled,
+                help="Cancelled by the strategy (e.g. on session_end) or "
+                     "by the orchestrator's session-end cleanup."
+            )
+            cols2[2].metric(
+                "Rejected", _rejected,
+                help="Rejected at fill time — leverage cap, max positions, "
+                     "or invalid stop/target geometry. Usually a sign the "
+                     "strategy's stop sat on the wrong side of the actual "
+                     "fill price."
+            )
+            cols2[3].metric(
+                "Still pending", max(0, _unaccounted),
+                help="Orders still in the book at run-end (rare)."
+            )
         # Score histogram
         if len(_scores) >= 10:
             with st.expander("Confluence score distribution"):
@@ -1180,10 +1306,42 @@ if mode == "Single backtest":
             key="trade_inspector_overlays",
         )
 
+        # ---- Chart timeframe selector ----
+        # Resample on the fly so the user can flip between e.g. 1m (what
+        # the broker actually executed against) and 15m (what the trigger
+        # strategy "saw"). Cheap — pandas resample is O(n) and the trade
+        # window is small.
+        from backtest.indicators import to_higher_timeframe as _to_htf
+        _tf_options = ["1m", "5m", "15m", "30m", "1h", "4h", "1d"]
+        # Default = data interval; only show TFs >= data interval (we
+        # can't downsample to a finer view than the data).
+        _valid_chart_tfs = [t for t in _tf_options if t == interval
+                            or (interval in _tf_options
+                                and _tf_options.index(t) >= _tf_options.index(interval))]
+        if not _valid_chart_tfs:
+            _valid_chart_tfs = [interval]
+        chart_tf = st.selectbox(
+            "Chart timeframe",
+            _valid_chart_tfs, index=0,
+            key="trade_inspector_chart_tf",
+            help=("Resample the inspector chart to a different TF on the "
+                  "fly. Useful when running decoupled (e.g. 1m data + 15m "
+                  "trigger): switch to 15m to see what the strategy was "
+                  "looking at, switch to 1m to see the actual execution "
+                  "path. Entry/exit markers are placed at their real "
+                  "timestamps either way."),
+        )
+        # Apply the resample if user picked a higher TF
+        if chart_tf == interval:
+            inspector_data = data
+        else:
+            inspector_data = _to_htf(data, chart_tf, include_partial=True)
+
         c1, c2 = st.columns([3, 1])
         with c1:
             # TradingView Lightweight Charts is the sole renderer.
-            trade_inspector_lwc(picked_trade, data, overlays=chosen_overlays)
+            trade_inspector_lwc(picked_trade, inspector_data,
+                                 overlays=chosen_overlays)
         with c2:
             st.markdown("**Trade details**")
             st.write(f"Side: **{picked_trade['side']}**")

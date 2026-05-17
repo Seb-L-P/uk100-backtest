@@ -203,6 +203,19 @@ def profile_for(instrument: str | None) -> CostModel:
     if s.endswith(".LSE") or s.endswith(".L") or s.endswith(".AS"):
         return PROFILES["ETF"]
 
+    # US stock ticker pattern: 1-5 uppercase letters, no exchange suffix.
+    # Covers AAPL, TSLA, MSFT, NVDA, AMZN, GOOGL, META, etc. without
+    # maintaining a hardcoded list. Bare tickers like "TSLA" used to fall
+    # through to DEFAULT (10 bps spread) — too punishing for liquid US
+    # equities. STOCK profile (10 bps spread, 4 bps slippage) is closer
+    # to real IG CFD costs.
+    import re as _re
+    if _re.match(r"^[A-Z]{1,5}$", s):
+        return PROFILES["STOCK"]
+    # Also catch ticker.US (EODHD format for US equities)
+    if s.endswith(".US"):
+        return PROFILES["STOCK"]
+
     # Default: bps-based, scale-invariant
     return PROFILES["DEFAULT"]
 
@@ -220,6 +233,80 @@ class AccountConfig:
 # Active config — defaults to UK100 for backward-compat with existing code/tests.
 COSTS = PROFILES["UK100"]
 ACCOUNT = AccountConfig()
+
+# Active trading timezone. All fetched data is converted to this TZ on load,
+# so when a strategy says session_open=time(8,30) it means 8:30 in YOUR
+# local time — not the exchange's local time, not UTC. Defaults to London
+# but the UI can override per-session.
+#   - UK 100, FTSE stocks: leave as Europe/London (matches IG quote hours).
+#   - TSLA / US stocks: Europe/London means market open at 14:30 (winter)
+#     or 14:30 (summer — UK and US DST align), close at 21:00 / 21:00.
+#   - Want NY-time displays instead? Set to America/New_York.
+TRADING_TZ: str = "Europe/London"
+
+
+# ---- Trading hours per cost profile ------------------------------------
+# In Europe/London (the active TRADING_TZ). When the user picks a "Data hours"
+# mode in the UI, the fetcher filters bars to be inside this window.
+#
+# RTH: regular trading hours — the period of deep liquidity and tight
+#      spreads. The default for backtesting unless you specifically WANT
+#      to model thin-liquidity pre/post-market behaviour.
+# ETH: extended hours — adds typical pre-market AND post-market windows.
+#      Use only if you intend to trade those hours with a broker that
+#      gives you access to them at realistic costs.
+# None: no filter — the data covers whatever the source provides. Use for
+#      crypto (24/7) and assets where session hours aren't meaningful.
+TRADING_HOURS_LONDON: dict[str, dict[str, tuple[str, str] | None]] = {
+    "UK100":   {"rth": ("08:00", "16:30"), "eth": ("08:00", "16:30")},
+    "US500":   {"rth": ("14:30", "21:00"), "eth": ("14:00", "22:00")},
+    "US100":   {"rth": ("14:30", "21:00"), "eth": ("14:00", "22:00")},
+    "DJI":     {"rth": ("14:30", "21:00"), "eth": ("14:00", "22:00")},
+    "GER40":   {"rth": ("08:00", "21:00"), "eth": ("08:00", "21:00")},
+    "JPN225":  {"rth": ("00:00", "07:00"), "eth": ("00:00", "07:00")},
+    "FRA40":   {"rth": ("08:00", "16:30"), "eth": ("08:00", "16:30")},
+    "EURUSD":  {"rth": None, "eth": None},    # FX trades 24h M-F
+    "GBPUSD":  {"rth": None, "eth": None},
+    "USDJPY":  {"rth": None, "eth": None},
+    "BTC":     {"rth": None, "eth": None},    # crypto 24/7
+    "ETH":     {"rth": None, "eth": None},
+    "STOCK":   {"rth": ("14:30", "21:00"), "eth": ("09:00", "22:00")},  # US default
+    "ETF":     {"rth": ("08:00", "16:30"), "eth": ("08:00", "16:30")},  # UK ETF default
+    "DEFAULT": {"rth": ("14:30", "21:00"), "eth": ("14:00", "22:00")},
+}
+
+
+def trading_window_for(profile_name: str, mode: str = "rth") -> tuple[str, str] | None:
+    """
+    Look up the (open, close) clock window in TRADING_TZ for a given cost
+    profile and mode. Returns None if the asset has no session filter
+    (crypto, FX, etc.).
+    """
+    p = TRADING_HOURS_LONDON.get(profile_name.upper())
+    if p is None:
+        p = TRADING_HOURS_LONDON["DEFAULT"]
+    return p.get(mode.lower())
+
+
+def session_defaults_for(profile_name: str,
+                         mode: str = "rth") -> tuple[str, str, str] | None:
+    """
+    (session_open, session_close, flat_by) HH:MM strings for the graph's
+    session-time overrides. Picks slightly inside the trading window so
+    there's room for stops to develop before force-flat.
+
+    Returns None for 24/7 instruments — caller should allow_overnight.
+    """
+    w = trading_window_for(profile_name, mode)
+    if w is None:
+        return None
+    open_str, close_str = w
+    # flat_by 25 min before close = 5-bar buffer at 5m, 1-bar at 30m
+    from datetime import datetime, timedelta
+    cl = datetime.strptime(close_str, "%H:%M")
+    se = (cl - timedelta(minutes=30)).strftime("%H:%M")
+    flat = (cl - timedelta(minutes=5)).strftime("%H:%M")
+    return open_str, se, flat
 
 
 def with_profile(instrument: str) -> CostModel:

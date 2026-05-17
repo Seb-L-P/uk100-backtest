@@ -93,7 +93,15 @@ def fetch(
         df.columns = df.columns.get_level_values(0)
 
     df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
-    df.index = pd.to_datetime(df.index).tz_localize(None)
+    # yfinance returns the exchange's local tz when the index is tz-aware,
+    # and UTC-ish otherwise. Normalise to the user's trading tz so session
+    # times line up regardless of where the asset trades.
+    from data._tz import to_trading_tz
+    df.index = pd.to_datetime(df.index)
+    if df.index.tz is None:
+        df = to_trading_tz(df, source_tz="UTC")  # safest fallback
+    else:
+        df = to_trading_tz(df)
     df = _validate(df)
 
     df.to_parquet(cache_file)

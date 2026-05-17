@@ -115,11 +115,11 @@ def _to_symbol(ticker: str) -> tuple[str, float]:
 
 # ---- Cache -------------------------------------------------------------
 def _cache_path(symbol: str, interval: str, num_points: int) -> Path:
-    # `v2` prefix invalidates pre-scale-aware caches (Apr 2026). Without
-    # this, an ISF.LSE cache from before the proxy-rescale fix would be
-    # loaded as-is and silently apply the 10x-too-tight friction bug.
+    # `v3` prefix invalidates earlier caches:
+    #   v2: added proxy price scaling (UK100→ISF.LSE ×10)
+    #   v3: added trading-tz conversion on fetch (Apr 2026)
     safe = symbol.replace(".", "_").replace("^", "")
-    return DATA_CACHE / f"eodhd_v2_{safe}_{interval}_{num_points}pts.parquet"
+    return DATA_CACHE / f"eodhd_v3_{safe}_{interval}_{num_points}pts.parquet"
 
 
 # ---- Date helpers ------------------------------------------------------
@@ -248,7 +248,12 @@ def _fetch_eod(symbol: str, num_points: int, api_key: str, period: str = "d") ->
         "Close": df["close"].astype(float),
         "Volume": df.get("volume", 0).astype(float),
     })
-    out.index = out.index.tz_localize(None) if out.index.tz is not None else out.index
+    # EODHD daily data is in market-local (effectively naive — same date
+    # globally for a daily bar). Treat the index as UTC then re-cast to the
+    # trading tz so the rest of the system can compare bar.time() to user-tz
+    # session times consistently.
+    from data._tz import to_trading_tz
+    out = to_trading_tz(out, source_tz="UTC")
     return out.tail(num_points)
 
 
@@ -266,9 +271,17 @@ def _fetch_intraday(symbol: str, native_interval: str, num_points: int,
         available history — e.g. TSLA IPO'd 2010, BTC began 2014).
     """
     from_ts, to_ts = _intraday_range(native_interval, num_points)
-    # EODHD's documented limit is 600 calendar days per request. We use 599
-    # to be safe against off-by-one edge cases.
-    MAX_DAYS_PER_REQUEST = 599
+    # EODHD's per-request window varies by resolution:
+    #   1m  → 120 days max
+    #   5m  → 600 days max
+    #   1h  → 7200 days max (effectively unlimited)
+    # We use slightly smaller values to dodge off-by-one rejections.
+    if native_interval == "1m":
+        MAX_DAYS_PER_REQUEST = 119
+    elif native_interval == "5m":
+        MAX_DAYS_PER_REQUEST = 599
+    else:  # 1h and anything else
+        MAX_DAYS_PER_REQUEST = 7199
     MAX_SECONDS_PER_REQUEST = MAX_DAYS_PER_REQUEST * 24 * 3600
 
     chunks: list[pd.DataFrame] = []
@@ -276,7 +289,9 @@ def _fetch_intraday(symbol: str, native_interval: str, num_points: int,
     chunk_to = to_ts
     earliest_reached = False
     chunk_count = 0
-    MAX_CHUNKS = 50  # safety: cap at ~33 years even if user asked for more
+    # 1m needs more chunks per year (3 chunks/year × 33 years = ~100); for
+    # 5m and 1h the original 50 was plenty. Cap generously.
+    MAX_CHUNKS = 200
 
     while chunk_to > from_ts and not earliest_reached and chunk_count < MAX_CHUNKS:
         chunk_from = max(from_ts, chunk_to - MAX_SECONDS_PER_REQUEST)
@@ -330,7 +345,11 @@ def _fetch_intraday(symbol: str, native_interval: str, num_points: int,
         "Close": df["close"].astype(float),
         "Volume": df.get("volume", 0).fillna(0).astype(float),
     })
-    out.index = out.index.tz_localize(None) if out.index.tz is not None else out.index
+    # EODHD intraday timestamps are UTC. Convert to the user's trading tz
+    # so a UK trader sees TSLA market hours at 14:30-21:00 and a UK 100
+    # session at 08:00-16:30, regardless of where the asset trades.
+    from data._tz import to_trading_tz
+    out = to_trading_tz(out, source_tz="UTC")
     return out.tail(num_points)
 
 

@@ -100,7 +100,17 @@ def _params_widget(spec, params: dict, key_prefix: str,
 
 
 def _default_graph_spec(interval: str) -> dict:
+    """
+    Fresh graph spec. Session-time overrides default to whatever the
+    ACTIVE cost profile's RTH window is — that's the most likely correct
+    setting for the asset, so users don't fall through to the strategy's
+    UK-100-default 9:00-15:30 when trading AAPL.
+    """
     keys = _selectable_keys()
+    import config as _cfg
+    profile = getattr(_cfg, "COSTS", None)
+    profile_name = profile.instrument if profile is not None else "DEFAULT"
+    sess = _cfg.session_defaults_for(profile_name, mode="rth")
     return {
         "name": "",
         "trigger": {"strategy_key": keys[0] if keys else "sma",
@@ -112,6 +122,11 @@ def _default_graph_spec(interval: str) -> dict:
         "risk_ceiling": 1.0,
         "risk_curve": "linear",
         "tf_alpha": 0.5,
+        "min_bars_before_flat_by": 0,
+        "allow_overnight": sess is None,  # crypto/FX → carry overnight
+        "session_open_override": sess[0] if sess else None,
+        "session_close_override": sess[1] if sess else None,
+        "flat_by_override": sess[2] if sess else None,
     }
 
 
@@ -186,16 +201,43 @@ def graph_builder_ui(interval: str, is_grid: bool = False,
     trig_spec = reg.get(trig_key)
     gs["trigger"]["strategy_key"] = trig_key
 
-    # Trigger TF is LOCKED to the data interval. Mixing them (e.g. 5m data
-    # with a 15m trigger label) silently fed the trigger the wrong-resolution
-    # bars. If you want a different trigger TF, change the data interval.
-    trig_tf = interval
-    gs["trigger"]["timeframe"] = trig_tf
-    st.caption(
-        f"Trigger runs at **{trig_tf}** — locked to the data interval above. "
-        f"To trigger at a different TF, change the data interval. "
-        f"Supporters/vetoes can be at this TF or HIGHER."
+    # Trigger TF can now be DECOUPLED from the data interval. The orchestrator
+    # only fires the trigger on bars that close a window of the chosen TF, so:
+    #   - data 1m + trigger 15m → trigger decides every 15m, fills happen at
+    #     1m granularity (better intrabar SL/TP resolution, more accurate gaps)
+    #   - data == trigger → trigger fires every bar (no decoupling overhead)
+    # Trigger TF must be ≥ data interval (we can't downsample to a finer TF).
+    valid_trig_tfs = [tf for tf in ALL_TIMEFRAMES
+                      if tf_minutes(tf) >= tf_minutes(interval)]
+    default_trig_tf = (interval if interval in valid_trig_tfs
+                       else valid_trig_tfs[0])
+    cur_trig_tf = gs["trigger"].get("timeframe", default_trig_tf)
+    if cur_trig_tf not in valid_trig_tfs:
+        cur_trig_tf = default_trig_tf
+    trig_tf = st.selectbox(
+        "Trigger timeframe", valid_trig_tfs,
+        index=valid_trig_tfs.index(cur_trig_tf),
+        key="trigger_tf_pick",
+        help=(
+            "TF at which the trigger STRATEGY makes decisions. Defaults to "
+            "the data interval. Pick higher to decouple decisions from fills: "
+            "data 1m + trigger 15m means the strategy decides every 15m, "
+            "but stops/targets and pending limit orders fill at 1m "
+            "granularity — better intrabar accuracy on gappy bars."
+        ),
     )
+    gs["trigger"]["timeframe"] = trig_tf
+    if trig_tf != interval:
+        st.caption(
+            f"⚙️ Decoupled: data at **{interval}**, trigger decides on "
+            f"**{trig_tf}** closes. Fills (SL/TP/pending) happen at {interval} "
+            f"resolution. Slower to backtest but more accurate."
+        )
+    else:
+        st.caption(
+            f"Trigger runs at **{trig_tf}** — same as data interval. "
+            f"Supporters/vetoes can be at this TF or HIGHER."
+        )
 
     st.caption(trig_spec.description)
     param_grid: dict[str, list] = {}
@@ -337,6 +379,141 @@ def graph_builder_ui(interval: str, is_grid: bool = False,
         help="0 = all supporters weighted equally. 0.5 = closer TFs get √-weighted. "
              "1.0 = strict inverse-ratio. Higher = bigger penalty for distant TFs.",
     )
+
+    # ---- Session timing -----------------------------------------------
+    st.markdown("**Session timing**")
+    gs["allow_overnight"] = st.checkbox(
+        "Carry positions overnight (disable session force-flat)",
+        value=bool(gs.get("allow_overnight", False)),
+        help=("ON: positions stay open past session-end; real IG financing "
+              "is charged daily (~7.75% annual on long notional). Use for "
+              "swing/positional setups. "
+              "OFF (default): true day-trade — force-flat at the trigger "
+              "strategy's flat_by time (typically 15:30 UK)."),
+    )
+    gs["min_bars_before_flat_by"] = st.slider(
+        "Min bars before flat_by to allow new entry", 0, 32,
+        int(gs.get("min_bars_before_flat_by", 0)), 1,
+        help=("Blocks new entries that wouldn't have room to develop "
+              "before the session close. 0 = off. "
+              "Applies to both market signals AND pending limit/stop orders "
+              "placed by the trigger (limit orders that would fill too late "
+              "get cancelled). Ignored when 'Carry overnight' is on."),
+        disabled=bool(gs.get("allow_overnight", False)),
+    )
+
+    # ---- Session-time overrides --------------------------------------
+    # The trigger strategy has hardcoded defaults for session_open /
+    # session_close / flat_by — usually for the UK 100. Trading another
+    # asset (AAPL in UK time, BTC, etc.) means those defaults are wrong.
+    # Overrides here propagate to the orchestrator which enforces them at
+    # base-TF precision. Format: HH:MM in the trading timezone you picked.
+    with st.expander("Session times (overrides — leave blank to use strategy defaults)",
+                     expanded=False):
+        st.caption(
+            "If blank, the trigger's own session_open/close/flat_by are used "
+            "(UK 100 defaults: 8:30 / 15:00 / 15:30). For other assets, set "
+            "these so the strategy doesn't trade outside the asset's real "
+            "market hours."
+        )
+        # Quick preset buttons for common cases.
+        # NOTE: when a preset is clicked, we MUST update both the graph_spec
+        # dict AND the text_input widget keys in st.session_state — Streamlit
+        # gives widget-state priority over the `value=` argument on rerun,
+        # so updating only the dict was a silent no-op. Confirmed bug from
+        # AAPL pre-market trades in May 2026.
+        def _apply_preset(open_v, close_v, flat_v, overnight=False):
+            gs["session_open_override"] = open_v
+            gs["session_close_override"] = close_v
+            gs["flat_by_override"] = flat_v
+            if overnight:
+                gs["allow_overnight"] = True
+            # CRITICAL: also update the widget-state keys, otherwise the
+            # text_inputs keep their stale (empty) values on rerun.
+            st.session_state["sess_open_o"] = open_v or ""
+            st.session_state["sess_close_o"] = close_v or ""
+            st.session_state["sess_flat_o"] = flat_v or ""
+
+        b1, b2, b3, b4 = st.columns(4)
+        with b1:
+            if st.button("UK 100\n08:30 / 15:00 / 15:30", key="sess_uk100"):
+                _apply_preset("08:30", "15:00", "15:30")
+                st.rerun()
+        with b2:
+            if st.button("US stocks (UK time)\n14:30 / 20:00 / 20:30",
+                         key="sess_us"):
+                _apply_preset("14:30", "20:00", "20:30")
+                st.rerun()
+        with b3:
+            if st.button("Crypto 24/7\n00:00 / 23:59 / 23:59", key="sess_btc"):
+                _apply_preset("00:00", "23:59", "23:59", overnight=True)
+                st.rerun()
+        with b4:
+            if st.button("Clear overrides\n(use strategy defaults)",
+                         key="sess_clear"):
+                _apply_preset("", "", "")
+                # Also clear the underlying values so they really go to None
+                gs["session_open_override"] = None
+                gs["session_close_override"] = None
+                gs["flat_by_override"] = None
+                st.rerun()
+        # ---- Text inputs ----
+        # Streamlit rule: a widget can use EITHER `value=` OR `key=` with
+        # session_state, never both. The preset buttons write to
+        # st.session_state[<key>], so we must NOT also pass `value=`. We
+        # seed st.session_state from gs once (if the key isn't already set),
+        # then let the widget read/write its own session state directly.
+        for _k, _gk in (("sess_open_o", "session_open_override"),
+                        ("sess_close_o", "session_close_override"),
+                        ("sess_flat_o", "flat_by_override")):
+            if _k not in st.session_state:
+                st.session_state[_k] = gs.get(_gk) or ""
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.text_input("session_open", placeholder="e.g. 14:30",
+                          key="sess_open_o")
+        with c2:
+            st.text_input("session_close", placeholder="e.g. 20:00",
+                          key="sess_close_o")
+        with c3:
+            st.text_input("flat_by", placeholder="e.g. 20:30",
+                          key="sess_flat_o")
+
+        # Read back into graph spec — "" becomes None so the orchestrator
+        # falls through to strategy defaults.
+        gs["session_open_override"] = st.session_state["sess_open_o"] or None
+        gs["session_close_override"] = st.session_state["sess_close_o"] or None
+        gs["flat_by_override"] = st.session_state["sess_flat_o"] or None
+        # Inline warning when STOCK profile selected but no override set —
+        # the most common footgun (default UK times applied to US stock).
+        try:
+            from config import COSTS as _cur_cost
+            if (_cur_cost.instrument in ("STOCK", "ETF")
+                    and not gs.get("session_open_override")
+                    and not gs.get("session_close_override")):
+                st.warning(
+                    "⚠️ Cost profile is **STOCK/ETF** but session overrides "
+                    "are blank — the strategy will trade using UK 100 hours "
+                    "(8:30–15:30), which is PRE-MARKET for US stocks. "
+                    "Click '**US stocks (UK time)**' above to fix."
+                )
+        except Exception:
+            pass
+    # Translate bar-count → human-readable lead time so the user can pick
+    # without doing the arithmetic. Driven by the TRIGGER's TF (which is
+    # locked to the data interval).
+    _bar_min = tf_minutes(trig_tf)
+    _total_min = int(gs["min_bars_before_flat_by"]) * _bar_min
+    if _total_min == 0:
+        _lead = "no filter (any entry accepted up to flat_by)"
+    elif _total_min < 60:
+        _lead = f"≈ {_total_min} min of room before session close"
+    else:
+        _h, _m = divmod(_total_min, 60)
+        _lead = (f"≈ {_h}h {_m:02d}m of room before session close"
+                 if _m else f"≈ {_h}h of room before session close")
+    st.caption(_lead)
 
     # ---- Build the actual graph ---------------------------------------
     graph = dict_to_graph(gs)

@@ -163,13 +163,21 @@ class Broker:
         self.pending_orders: list[PendingOrder] = []
         self._next_id = 0
         self._next_order_id = 0
-        # Number of pending orders that couldn't fill (leverage cap, max
-        # positions). Surfaced in the metrics panel so the user knows.
+        # Number of pending orders rejected at FILL TIME — leverage cap
+        # exceeded, max positions hit, or invalid stop/target geometry.
         self._dropped_order_count = 0
         # Number of market-order entries skipped because the next bar's open
         # invalidated the strategy's stop/target geometry. Surfaced too so
         # the user can tell if a strategy is bleeding signals to gaps.
         self._dropped_geometry_count = 0
+        # Number of pending orders that aged out without ever filling
+        # (price never came back to the trigger within expires_after_bars).
+        # For FVG-style strategies this is typically the BIGGEST cause of
+        # "attempts > trades" — most FVGs don't get retested in time.
+        self._expired_order_count = 0
+        # Number of pending orders explicitly cancelled (by strategy logic,
+        # session-end cleanup, etc.) before they could fill.
+        self._cancelled_order_count = 0
 
     # ---- Backward-compat: single-position view ------------------------
     @property
@@ -521,6 +529,7 @@ class Broker:
         for o in self.pending_orders:
             if o.id == order_id:
                 self.pending_orders.remove(o)
+                self._cancelled_order_count += 1
                 return True
         return False
 
@@ -528,6 +537,7 @@ class Broker:
         """Cancel every pending order. Returns the number cancelled."""
         n = len(self.pending_orders)
         self.pending_orders.clear()
+        self._cancelled_order_count += n
         return n
 
     def check_pending_orders(self, time: datetime, bar: dict,
@@ -552,6 +562,7 @@ class Broker:
             if (order.expires_after_bars is not None
                     and order.bars_alive > order.expires_after_bars):
                 self.pending_orders.remove(order)
+                self._expired_order_count += 1
                 continue
 
             triggered, fill_price = self._check_order_trigger(order, bar, bar_spread)
@@ -571,6 +582,18 @@ class Broker:
                     entry_metadata=dict(order.entry_metadata),
                 )
                 newly_opened.append(pos)
+                # ---- Same-bar SL/TP check ----
+                # The position just opened MID-BAR via a limit/stop fill.
+                # The rest of this bar's range can still hit our SL/TP —
+                # in real life the broker's stop sits live with the fill and
+                # fires the moment price crosses. Without this check we'd
+                # wait until next bar's open and (worse) apply the gap-fill
+                # logic, which uses next bar's open as the reference — a
+                # bizarre price for an exit that should have happened in
+                # the same minute as the entry.
+                # Confirmed bug: AAPL trade #23, May 2026, lost 5R instead
+                # of planned 1R because the same-bar stop wasn't checked.
+                self._check_same_bar_exit(pos, time, bar, bar_spread)
             except (ValueError, RuntimeError) as e:
                 # Common (and usually expected): leverage cap or max-positions
                 # hit. Count silently — the run-end summary surfaces the count
@@ -580,28 +603,100 @@ class Broker:
             self.pending_orders.remove(order)
         return newly_opened
 
+    def _check_same_bar_exit(self, pos: OpenPosition, time: datetime,
+                             bar: dict, bar_spread: float | None) -> None:
+        """
+        After a position opens mid-bar (limit/stop fill), check whether the
+        SAME bar's range would also have crossed its SL/TP. Uses level-based
+        fills (not gap-aware) because the position was created INSIDE this
+        bar — the "gap" to the bar's open is irrelevant.
+
+        Tie-break when both could fire: stop wins (worst-case for trader).
+        """
+        bar_low = bar["Low"]
+        bar_high = bar["High"]
+        if pos.side == "long":
+            if pos.stop_loss is not None and bar_low <= pos.stop_loss:
+                self._close_full(pos, time, pos.stop_loss, "stop", bar_spread)
+                return
+            if pos.take_profit is not None and bar_high >= pos.take_profit:
+                self._close_full(pos, time, pos.take_profit, "target", bar_spread)
+        else:  # short
+            if pos.stop_loss is not None and bar_high >= pos.stop_loss:
+                self._close_full(pos, time, pos.stop_loss, "stop", bar_spread)
+                return
+            if pos.take_profit is not None and bar_low <= pos.take_profit:
+                self._close_full(pos, time, pos.take_profit, "target", bar_spread)
+
     def _check_order_trigger(self, order: PendingOrder, bar: dict,
                              bar_spread: float | None = None) -> tuple[bool, float]:
-        """Return (triggered, fill_price) given the bar's high/low range."""
-        low, high = bar["Low"], bar["High"]
+        """
+        Return (triggered, fill_price) given the bar's range.
+
+        Realistic fill model — limit and stop orders behave differently
+        depending on whether the bar's OPEN already crossed the trigger:
+
+        LIMIT BUY at T:
+          - bar.Open <= T   →  market opened past limit (FAVOURABLE).
+                                Real broker fills you at bar.Open (better
+                                than T). Skipping this case is the classic
+                                backtester bug — you'd never pay T when the
+                                market opened at a better price.
+          - bar.Open > T but bar.Low <= T → bar wandered down to T → fill at T
+          - else → no fill
+
+        LIMIT SELL at T:
+          - bar.Open >= T   →  fill at bar.Open (favourable for seller)
+          - bar.Open < T but bar.High >= T → fill at T
+          - else → no fill
+
+        STOP BUY at T:
+          - bar.Open >= T   →  gap up past trigger (UNFAVOURABLE).
+                                Fill at bar.Open + slippage (worse than T).
+          - bar.Open < T but bar.High >= T → fill at T + slippage
+          - else → no fill
+
+        STOP SELL at T:
+          - bar.Open <= T   →  gap down past trigger → fill at bar.Open − slip
+          - bar.Open > T but bar.Low <= T → fill at T − slip
+          - else → no fill
+
+        Bug history: prior version always filled at trigger price, which
+        let limit orders open positions at unrealistic prices when bar.Open
+        was already past the trigger. The strategy's stop/target geometry
+        (computed pre-fill) was then often invalid relative to the actual
+        market level — and the orchestrator's same-bar SL/TP check would
+        immediately stop the trade out at -1R. Net effect: phantom trades.
+        Confirmed in AAPL backtest, May 2026.
+        """
+        open_, low, high = bar["Open"], bar["Low"], bar["High"]
+
         if order.order_type == "limit":
-            # Limit buy: fill if price drops to trigger or below.
-            # Limit sell: fill if price rises to trigger or above.
-            if order.side == "long" and low <= order.trigger_price:
-                return True, order.trigger_price
-            if order.side == "short" and high >= order.trigger_price:
-                return True, order.trigger_price
+            T = order.trigger_price
+            if order.side == "long":
+                if open_ <= T:
+                    return True, open_           # already favourable
+                if low <= T:
+                    return True, T               # came down to trigger
+            else:  # short
+                if open_ >= T:
+                    return True, open_           # already favourable
+                if high >= T:
+                    return True, T               # came up to trigger
+
         elif order.order_type == "stop":
-            # Stop buy: fill if price rises through trigger (worse fill via slippage).
-            # Stop sell: fill if price falls through trigger.
-            # Slippage scales with the current bar's spread when known, else
-            # uses the cost profile (bps × price for bps-based instruments).
-            slip = self.costs.effective_slippage_pts(bar_spread,
-                                                     price=order.trigger_price)
-            if order.side == "long" and high >= order.trigger_price:
-                return True, order.trigger_price + slip
-            if order.side == "short" and low <= order.trigger_price:
-                return True, order.trigger_price - slip
+            T = order.trigger_price
+            slip = self.costs.effective_slippage_pts(bar_spread, price=T)
+            if order.side == "long":
+                if open_ >= T:
+                    return True, open_ + slip    # gap-up past stop (worse)
+                if high >= T:
+                    return True, T + slip
+            else:  # short
+                if open_ <= T:
+                    return True, open_ - slip    # gap-down past stop (worse)
+                if low <= T:
+                    return True, T - slip
         return False, 0.0
 
     # ---- Per-bar updates ----------------------------------------------
@@ -664,15 +759,44 @@ class Broker:
 
     def _check_one_position_stops(self, pos: OpenPosition, time: datetime, bar: dict,
                                   bar_spread: float | None = None) -> Trade | None:
-        # Conservative: if both stop and target inside the bar, assume stop first
+        """
+        Check this position for stop / target hits during the bar.
+
+        Realism note — gap fills:
+          Real-life limit/stop fills happen at the FIRST traded price that
+          crosses the trigger level. On a normal bar that price IS the
+          trigger level (price walks through it intrabar). On a GAP bar
+          (open is already past the trigger) you fill at the OPEN — better
+          than your target on a favourable gap, WORSE than your stop on
+          an adverse gap. Modelling this is essential for honest gap-risk
+          reporting; otherwise stops appear safer than reality.
+
+        Conservative tie-break: if both stop and target are inside the bar
+        range, we assume STOP fires first (worst-case for the trader).
+        """
+        bar_open = bar["Open"]
         if pos.side == "long":
+            # Long stop: bar's low touched the stop.
             if pos.stop_loss is not None and bar["Low"] <= pos.stop_loss:
-                return self._close_full(pos, time, pos.stop_loss, "stop", bar_spread)
+                # Gap-down past the stop? Fill at the gap open (worse for us),
+                # else fill at the stop level itself.
+                fill = min(pos.stop_loss, bar_open)
+                return self._close_full(pos, time, fill, "stop", bar_spread)
+            # Long target: bar's high touched the target.
             if pos.take_profit is not None and bar["High"] >= pos.take_profit:
-                return self._close_full(pos, time, pos.take_profit, "target", bar_spread)
+                # Gap-up past the target? Fill at the gap open (better for us),
+                # else fill at the target level.
+                fill = max(pos.take_profit, bar_open)
+                return self._close_full(pos, time, fill, "target", bar_spread)
         else:
+            # Short stop: bar's high touched the stop.
             if pos.stop_loss is not None and bar["High"] >= pos.stop_loss:
-                return self._close_full(pos, time, pos.stop_loss, "stop", bar_spread)
+                # Gap-up past the stop? Fill at the gap open (worse for us).
+                fill = max(pos.stop_loss, bar_open)
+                return self._close_full(pos, time, fill, "stop", bar_spread)
+            # Short target: bar's low touched the target.
             if pos.take_profit is not None and bar["Low"] <= pos.take_profit:
-                return self._close_full(pos, time, pos.take_profit, "target", bar_spread)
+                # Gap-down past the target? Fill at the gap open (better for us).
+                fill = min(pos.take_profit, bar_open)
+                return self._close_full(pos, time, fill, "target", bar_spread)
         return None

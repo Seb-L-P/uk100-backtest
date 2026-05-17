@@ -62,6 +62,11 @@ def graph_to_dict(graph: DecisionGraph, name: str) -> dict:
         "risk_ceiling": graph.risk_ceiling,
         "risk_curve": graph.risk_curve,
         "tf_alpha": graph.tf_alpha,
+        "min_bars_before_flat_by": graph.min_bars_before_flat_by,
+        "allow_overnight": graph.allow_overnight,
+        "session_open_override": graph.session_open_override,
+        "session_close_override": graph.session_close_override,
+        "flat_by_override": graph.flat_by_override,
     }
 
 
@@ -77,6 +82,11 @@ def dict_to_graph(d: dict) -> DecisionGraph:
         risk_ceiling=d.get("risk_ceiling", 1.0),
         risk_curve=d.get("risk_curve", "linear"),
         tf_alpha=d.get("tf_alpha", 0.5),
+        min_bars_before_flat_by=int(d.get("min_bars_before_flat_by", 0)),
+        allow_overnight=bool(d.get("allow_overnight", False)),
+        session_open_override=d.get("session_open_override"),
+        session_close_override=d.get("session_close_override"),
+        flat_by_override=d.get("flat_by_override"),
         preset_name=d.get("name"),
     )
     return g

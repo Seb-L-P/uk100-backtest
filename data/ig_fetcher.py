@@ -264,8 +264,11 @@ def _ig_to_ohlcv(raw: pd.DataFrame) -> pd.DataFrame:
         })
 
     out.index = pd.to_datetime(out.index)
-    if out.index.tz is not None:
-        out.index = out.index.tz_localize(None)
+    # IG snapshot timestamps are UTC. Convert to the user's trading tz so
+    # session_open/close comparisons in strategies line up with the
+    # trader's clock.
+    from data._tz import to_trading_tz
+    out = to_trading_tz(out, source_tz="UTC")
     return out
 
 

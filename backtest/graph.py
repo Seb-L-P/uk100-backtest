@@ -107,6 +107,21 @@ def tf_minutes(tf: str) -> int:
     return _TF_MINUTES[tf]
 
 
+def _parse_hhmm(s: str | None):
+    """Parse 'HH:MM' to datetime.time, or None for None/empty input."""
+    if not s:
+        return None
+    from datetime import time as _time
+    parts = s.strip().split(":")
+    if len(parts) != 2:
+        return None
+    try:
+        h, m = int(parts[0]), int(parts[1])
+        return _time(h, m)
+    except ValueError:
+        return None
+
+
 def is_higher_or_equal_tf(supporter_tf: str, trigger_tf: str) -> bool:
     return tf_minutes(supporter_tf) >= tf_minutes(trigger_tf)
 
@@ -171,6 +186,28 @@ class DecisionGraph:
     # default → halving every doubling of the TF.
     tf_alpha: float = 0.5
 
+    # ---- Session timing knobs ----------------------------------------
+    # Late-entry filter: refuse new entries when fewer than this many bars
+    # remain until the trigger's `flat_by`. Stops the engine from opening
+    # trades that get force-closed before they can develop. Default 0 = off.
+    min_bars_before_flat_by: int = 0
+
+    # Disable the trigger's session-end force-close entirely. Positions
+    # carry overnight and accrue real IG financing (already modelled in
+    # the cost profile). Use this for swing/positional setups where holding
+    # past 15:30 is part of the design — not for true day-trade strategies.
+    allow_overnight: bool = False
+
+    # ---- Per-graph session-time overrides ----
+    # When set (HH:MM strings), these override the trigger strategy's own
+    # defaults. Useful for trading a US asset in UK time, where the FVG
+    # strategy's UK-100-default `flat_by=15:30` would force-close at AAPL's
+    # 30-minutes-after-open. Leave None to use the strategy's hardcoded
+    # defaults. Stored as strings so they JSON-serialise cleanly into presets.
+    session_open_override: str | None = None
+    session_close_override: str | None = None
+    flat_by_override: str | None = None
+
     # Optional preset name (for run-history linkage). Set by load/save.
     preset_name: str | None = None
 
@@ -209,6 +246,48 @@ class GraphOrchestrator:
     def __init__(self, graph: DecisionGraph):
         self.graph = graph
         self._trigger = graph.trigger.build()
+
+        # ---- Session-time ownership ----
+        # Strategies have internal `flat_by` / `session_open` / `session_close`
+        # checks that compare `history.index[-1].time()` to the configured
+        # times. When trigger TF > base TF, `history.index[-1]` is the
+        # RESAMPLED bar's start time (label="left"), NOT the real wall-clock
+        # time — so those checks fire one trigger period LATE.
+        #
+        # Fix: capture the trigger's session times into orchestrator state,
+        # then NEUTRALISE the checks inside the trigger by pushing the
+        # attributes to "always-in-session" sentinels. The orchestrator runs
+        # on every BASE bar and enforces real-time session gating itself.
+        from datetime import time as _time
+
+        # Resolve from graph override → trigger attribute → None
+        def _resolve_time(graph_override, trigger_attr):
+            if graph_override is not None:
+                return _parse_hhmm(graph_override)
+            return getattr(self._trigger, trigger_attr, None)
+
+        self._session_open = _resolve_time(
+            graph.session_open_override, "session_open"
+        )
+        self._session_close = _resolve_time(
+            graph.session_close_override, "session_close"
+        )
+        self._session_flat_by = _resolve_time(
+            graph.flat_by_override, "flat_by"
+        )
+        if graph.allow_overnight:
+            self._session_flat_by = None  # never force-close
+
+        # Neutralise the trigger's internal session-time checks so they
+        # don't fire at the (lagged) trigger-TF cadence. The orchestrator
+        # owns timing now.
+        if hasattr(self._trigger, "session_open"):
+            self._trigger.session_open = _time(0, 0, 0)
+        if hasattr(self._trigger, "session_close"):
+            self._trigger.session_close = _time(23, 59, 59)
+        if hasattr(self._trigger, "flat_by"):
+            self._trigger.flat_by = _time(23, 59, 59)
+
         # Build supporter/veto instances. Independent state per node, so the
         # same strategy class can appear multiple times with no aliasing.
         self._supporters: list[tuple[float, object, str]] = []
@@ -224,17 +303,105 @@ class GraphOrchestrator:
         self.attempted = 0
         self.blocked_veto = 0
         self.blocked_score = 0
+        self.blocked_late_entry = 0
         self.scores: list[float] = []
         self.last_supporters: list[dict] = []
 
+        # Base TF (in minutes) detected from the FIRST history we see. The
+        # engine feeds us base-TF bars even if the trigger runs on a higher
+        # TF — decoupling lets stops/targets/pending-orders fill at base
+        # resolution while the trigger decides at its own cadence.
+        self._base_tf_min: int | None = None
+
     # ---- Engine interface ----
     def on_bar(self, history, broker):
-        proxy = _GraphBrokerProxy(broker, self, history)
-        signal = self._trigger.on_bar(history, proxy)
+        # Detect the base TF on the first bar. We trust the cadence of the
+        # data we're being fed — that's what the engine iterates at.
+        if self._base_tf_min is None and len(history) >= 2:
+            d = history.index[-1] - history.index[-2]
+            self._base_tf_min = max(1, int(round(d.total_seconds() / 60)))
+
+        trigger_tf_min = tf_minutes(self.graph.trigger.timeframe)
+        base_tf_min = self._base_tf_min or trigger_tf_min
+
+        # If trigger TF < base TF, that's a config error — supporters can
+        # be at base TF or higher, the trigger MUST run at base TF or higher.
+        if trigger_tf_min < base_tf_min:
+            return self._noop_signal(
+                f"trigger TF ({self.graph.trigger.timeframe}) < base TF "
+                f"({base_tf_min}m). Pick trigger TF >= data interval."
+            )
+
+        # ---- Session-end enforcement (BASE-TF precision) ----
+        # Runs every base bar. Catches flat_by at 1-minute precision even
+        # when the trigger is decoupled to 15m, fixing the "trade closes
+        # 15-30 min late" bug.
+        real_time = history.index[-1].time()
+        if (self._session_flat_by is not None
+                and real_time >= self._session_flat_by):
+            # Cancel any pending orders (so they can't fill after hours)
+            if broker.pending_orders:
+                for o in list(broker.pending_orders):
+                    broker.cancel_pending_order(o.id)
+            # Close any open position
+            if broker.positions:
+                return self._close_all_signal("session_end")
+            return self._noop_signal("past session_end")
+
+        # ---- Out-of-session: no new entries ----
+        # Before session_open or after session_close (but before flat_by):
+        # let existing positions run, but don't even consult the trigger
+        # for new entries.
+        if (self._session_open is not None
+                and self._session_close is not None
+                and not (self._session_open <= real_time <= self._session_close)):
+            return self._noop_signal("outside entry window")
+
+        # Decide whether THIS base bar coincides with a trigger-TF close.
+        # On a 1m base / 15m trigger: only base bars at HH:00, HH:15, HH:30,
+        # HH:45 will trigger. On equal TFs, every bar triggers (current
+        # behaviour).
+        if not self._is_trigger_close(history.index[-1], base_tf_min, trigger_tf_min):
+            return self._noop_signal("not a trigger-TF close")
+
+        # Build the trigger's history at ITS own TF — resampled from the
+        # base bars we've seen so far. include_partial=False guarantees we
+        # never feed it a still-forming bar (look-ahead safety).
+        if trigger_tf_min == base_tf_min:
+            trigger_history = history
+        else:
+            from backtest.indicators import to_higher_timeframe
+            trigger_history = to_higher_timeframe(
+                history, self.graph.trigger.timeframe, include_partial=False
+            )
+            if len(trigger_history) < 2:
+                return self._noop_signal("not enough trigger-TF history yet")
+
+        # IMPORTANT: hand the trigger a proxy whose `history` reference is
+        # ALSO at the trigger's TF, so supporter/veto checks done inside
+        # pending-order placements see consistent data.
+        proxy = _GraphBrokerProxy(broker, self, trigger_history)
+        signal = self._trigger.on_bar(trigger_history, proxy)
 
         if signal.action in ("open_long", "open_short"):
             side = "long" if signal.action == "open_long" else "short"
             self.attempted += 1
+
+            # ---- Late-entry filter ----
+            # If the trigger has a flat_by AND the graph wants a minimum
+            # number of bars before it, refuse to open a trade that won't
+            # have room to develop. Prevents the "entered at 14:45, forced
+            # out at 15:30" pattern that destroys 2R-target strategies.
+            if self.graph.min_bars_before_flat_by > 0:
+                remaining = self._bars_until_flat_by(history.index[-1])
+                if remaining is not None and remaining < self.graph.min_bars_before_flat_by:
+                    self.blocked_late_entry += 1
+                    signal.action = "noop"
+                    signal.reason = (f"late_entry: only {remaining} bars "
+                                     f"to flat_by, need "
+                                     f"{self.graph.min_bars_before_flat_by}")
+                    return signal
+
             veto = self._find_firing_veto(side, history)
             if veto is not None:
                 self.blocked_veto += 1
@@ -282,6 +449,65 @@ class GraphOrchestrator:
         return getattr(self._trigger, name)
 
     # ---- Internals ----
+    @staticmethod
+    def _noop_signal(reason: str):
+        """Build a noop Signal — broken out for use in early-returns of on_bar."""
+        from backtest.engine import Signal
+        return Signal(action="noop", reason=reason)
+
+    @staticmethod
+    def _close_all_signal(reason: str):
+        from backtest.engine import Signal
+        return Signal(action="close_all", reason=reason)
+
+    @staticmethod
+    def _is_trigger_close(now: pd.Timestamp,
+                          base_tf_min: int, trigger_tf_min: int) -> bool:
+        """
+        True iff this base-TF bar coincides with the close of a trigger-TF
+        bar — i.e. the NEXT base bar would start a new trigger-TF window.
+
+        Conventions:
+          - bar timestamps in our data are bar START times (label="left").
+          - a 15m trigger window at 09:00 covers [09:00, 09:15).
+          - it closes at 09:15. The last 1m base bar inside the window is
+            the one starting at 09:14 (covering 09:14-09:15). After mark
+            and stop checks on that bar, we ARE at the 15m close moment.
+
+        So the test is: (now + base_tf_min) is a multiple of trigger_tf_min
+        from session start (using minute-of-day so it works across DST).
+        """
+        if base_tf_min >= trigger_tf_min:
+            return True  # equal TFs always trigger; sanity-checked by caller
+        end_minute = (now.hour * 60 + now.minute + base_tf_min)
+        # For daily / weekly triggers, the boundary alignment is per-day, so
+        # match if end_minute is divisible by trigger_tf_min OR end_minute is
+        # at the configured day boundary (00:00). The simple modulo handles
+        # all the intra-day cases we care about (15m/30m/1h/4h triggers).
+        if trigger_tf_min < 24 * 60:
+            return end_minute % trigger_tf_min == 0
+        # Daily+ trigger on intraday base: fire only at end-of-day.
+        return end_minute % (24 * 60) == 0
+
+    def _bars_until_flat_by(self, now: pd.Timestamp) -> int | None:
+        """
+        Number of BASE-TF bars between `now` and the resolved flat_by today.
+        Uses the orchestrator's captured `_session_flat_by` (NOT the trigger's
+        own attribute, which we've neutralised). Returns None if no flat_by
+        is configured (allow_overnight, or strategy without session timing).
+        """
+        flat_by = self._session_flat_by
+        if flat_by is None:
+            return None
+        if now.time() >= flat_by:
+            return 0
+        flat_dt = pd.Timestamp.combine(now.date(), flat_by)
+        if hasattr(now, "tz") and now.tz is not None:
+            flat_dt = flat_dt.tz_localize(now.tz)
+        delta_min = (flat_dt - now).total_seconds() / 60.0
+        bar_min = self._base_tf_min or tf_minutes(self.graph.trigger.timeframe)
+        return int(delta_min // bar_min)
+
     def _history_at_tf(self, base_history: pd.DataFrame, tf: str) -> pd.DataFrame:
         """
         Return look-ahead-safe history at `tf`.
@@ -375,6 +601,19 @@ class _GraphBrokerProxy:
     def place_pending_order(self, side, order_type, trigger_price,
                             stake_per_point, time, **kwargs):
         self._orch.attempted += 1
+
+        # ---- Late-entry filter (also applies to pending orders) ----
+        # The trigger may have placed a limit / stop well in advance, but if
+        # it would only have a handful of bars to develop before flat_by we
+        # cancel it just like a fresh market entry. Returns a ghost order
+        # that's never registered with the broker, so it can't fill.
+        if self._orch.graph.min_bars_before_flat_by > 0:
+            remaining = self._orch._bars_until_flat_by(self._history.index[-1])
+            if (remaining is not None
+                    and remaining < self._orch.graph.min_bars_before_flat_by):
+                self._orch.blocked_late_entry += 1
+                return _ghost_order(side, order_type, trigger_price, time, kwargs)
+
         veto = self._orch._find_firing_veto(side, self._history)
         if veto is not None:
             self._orch.blocked_veto += 1

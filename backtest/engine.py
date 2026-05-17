@@ -191,24 +191,42 @@ def run_backtest(
             if not pd.isna(spread_val):
                 bar_dict["Spread"] = spread_val
 
-        # Execute any pending market signal at this bar's open
+        # ---- ORDER OF OPERATIONS (per bar) ----
+        # Closely models real-life IG semantics:
+        #   1. Existing positions' active SL/TP orders are LIVE WITH THE
+        #      BROKER. They fire as soon as price reaches them — including
+        #      on a gap-open. So check stops FIRST against the bar's range
+        #      (broker.check_stops handles gap-fill pricing).
+        #   2. Any pending strategy market signal (e.g. session-end close
+        #      from the previous bar) executes at this bar's OPEN. By
+        #      definition this runs AFTER #1, so a take-profit that already
+        #      filled on the gap-open isn't double-closed by a session-end
+        #      market close at a worse price.
+        #   3. Pending limit/stop orders placed by the strategy itself
+        #      then get a chance to fill on this bar's range.
+        #   4. Mark equity + accrue financing on whatever's still open.
+        # Previously stops were checked AFTER the pending close, which let
+        # session-end closes pre-empt a target/stop that should have fired
+        # on the same bar's gap. Realism fix: April 2026.
+
+        # 1. Existing-position SL/TP first (with gap-aware fills)
+        broker.check_stops(time, bar_dict)
+
+        # 2. Apply any pending strategy signal (entry / close / scale) at OPEN
         if pending is not None:
             _apply_signal(pending, broker, time, bar_dict["Open"],
                           entry_spread_pts=bar_dict.get("Spread"))
             pending = None
 
-        # Check pending limit/stop orders against this bar's range.
-        # Must come BEFORE mark/check_stops so a newly-filled position can
-        # have its stop checked on the same bar if the bar's range touched both.
+        # 3. Pending limit/stop orders placed by the strategy may now fill.
+        #    Must come AFTER the pending market signal so a same-bar reverse
+        #    closes the old position before the new one fills.
         if broker.pending_orders:
             broker.check_pending_orders(time, bar_dict,
                                         bar_spread=bar_dict.get("Spread"))
 
-        # Mark equity + accrue financing on any open position
+        # 4. Mark equity + accrue financing on any open position
         broker.mark(time, bar_dict)
-
-        # Stop/target hit during this bar?
-        broker.check_stops(time, bar_dict)
 
         # Strategy decides (only after warmup)
         if i >= warmup_bars:
@@ -265,7 +283,7 @@ def run_backtest(
     # don't accidentally inherit this run's data.
     _mtf_set_active(None)
 
-    return BacktestResult(
+    result = BacktestResult(
         trades_df=trades_df,
         equity_curve=eq,
         final_balance=broker.balance,
@@ -273,6 +291,14 @@ def run_backtest(
         bars_processed=n,
         strategy_name=type(strategy).__name__,
     )
+    # Attach broker-side flow counters to the result so the UI can show a
+    # full "where did the attempts go" breakdown:
+    #   attempts = filled (trades) + expired + cancelled + rejected
+    result._expired_order_count = broker._expired_order_count
+    result._cancelled_order_count = broker._cancelled_order_count
+    result._dropped_order_count = broker._dropped_order_count
+    result._dropped_geometry_count = broker._dropped_geometry_count
+    return result
 
 
 def _gap_invalidates(side: str, fill_price: float,
