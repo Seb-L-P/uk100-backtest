@@ -39,6 +39,52 @@ def _selectable_keys() -> list[str]:
     return [k for k in reg.STRATEGIES.keys() if k not in _HIDDEN_STRATEGIES]
 
 
+def _slider_with_input(label: str, mn, mx, value, step, key: str,
+                       help_text: str | None, value_type: str):
+    """
+    Paired slider + number-input that share state. Drag the slider OR type
+    a precise value — either updates the other. Pattern: each widget has
+    its own key but their on_change callbacks copy into the canonical key.
+
+    `value_type` is "int" or "float", drives the number_input's format.
+    """
+    canonical = key
+    slider_k = f"{key}__slider"
+    number_k = f"{key}__number"
+    # Seed all three keys once so widgets render with the right initial
+    # value on the first run and after preset-loads.
+    if canonical not in st.session_state:
+        st.session_state[canonical] = value
+    if slider_k not in st.session_state:
+        st.session_state[slider_k] = st.session_state[canonical]
+    if number_k not in st.session_state:
+        st.session_state[number_k] = st.session_state[canonical]
+
+    def _from_slider():
+        v = st.session_state[slider_k]
+        st.session_state[canonical] = v
+        st.session_state[number_k] = v
+
+    def _from_number():
+        v = st.session_state[number_k]
+        # Clamp to range so out-of-bounds typed values don't explode the slider
+        v = max(mn, min(mx, v))
+        st.session_state[canonical] = v
+        st.session_state[slider_k] = v
+        st.session_state[number_k] = v
+
+    col_a, col_b = st.columns([3, 1])
+    with col_a:
+        st.slider(label, mn, mx, key=slider_k, step=step,
+                  help=help_text, on_change=_from_slider)
+    with col_b:
+        fmt = "%d" if value_type == "int" else "%.4g"
+        st.number_input(" ", min_value=mn, max_value=mx, step=step,
+                        key=number_k, on_change=_from_number,
+                        format=fmt, label_visibility="collapsed")
+    return st.session_state[canonical]
+
+
 def _params_widget(spec, params: dict, key_prefix: str,
                    is_grid: bool = False, is_optuna: bool = False) -> dict:
     """
@@ -80,16 +126,18 @@ def _params_widget(spec, params: dict, key_prefix: str,
                 out[p.name] = [p.default]
         else:
             if p.type == "int":
-                out[p.name] = st.slider(
+                out[p.name] = _slider_with_input(
                     p.label, int(p.min), int(p.max), int(existing),
-                    step=int(p.step) if p.step else 1,
-                    help=p.help, key=f"{key_prefix}_{p.name}",
+                    int(p.step) if p.step else 1,
+                    key=f"{key_prefix}_{p.name}",
+                    help_text=p.help, value_type="int",
                 )
             elif p.type == "float":
-                out[p.name] = st.slider(
+                out[p.name] = _slider_with_input(
                     p.label, float(p.min), float(p.max), float(existing),
-                    step=float(p.step) if p.step else 0.1,
-                    help=p.help, key=f"{key_prefix}_{p.name}",
+                    float(p.step) if p.step else 0.1,
+                    key=f"{key_prefix}_{p.name}",
+                    help_text=p.help, value_type="float",
                 )
             elif p.type == "bool":
                 out[p.name] = st.checkbox(

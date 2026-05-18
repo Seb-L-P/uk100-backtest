@@ -47,9 +47,6 @@ from backtest.sweep import grid_sweep, evaluate_oos
 from backtest.optuna_search import run_optuna_study
 from backtest.run_history import save_run, list_runs, delete_run, count_runs
 from strategies import registry as reg
-# Old ensemble classes (VoteEnsemble, FilterEnsemble) are deprecated —
-# their roles are subsumed by the decision graph. Strategies are now
-# composed via app_graph_builder + backtest.graph.
 
 
 # ---- Page config -------------------------------------------------------
@@ -63,8 +60,6 @@ BARS_PER_YEAR = {
     "1m": 252 * 510, "5m": 252 * 102, "15m": 252 * 34,
     "30m": 252 * 17, "1h": 252 * 8, "1d": 252,
 }
-
-# (Ensemble-related constants removed; graph builder owns strategy composition.)
 
 
 # ---- Cached data fetch -------------------------------------------------
@@ -115,10 +110,16 @@ with st.sidebar:
         )
         ig_num_points = st.slider(
             "Bars to fetch",
-            min_value=500, max_value=200000, value=5000, step=500,
+            min_value=500, max_value=2_000_000, value=5000, step=1000,
             help="EODHD gives 100k API calls/day — each unique fetch is "
-                 "one call, cached forever after. Effectively unlimited. "
-                 "200k of 15m ≈ 5 years of UK trading.",
+                 "one call (per 119-day chunk for 1m, 600-day for 5m). "
+                 "Cached forever after. Practical caps by interval: "
+                 "1m ≈ 1.5M bars (~6 years of US RTH); "
+                 "5m ≈ 600k (~10 years); "
+                 "15m ≈ 200k (~12 years); "
+                 "1h ≈ 60k (~30 years). "
+                 "Backtest time scales linearly with bars — 1M+ bars "
+                 "may take 5+ minutes per run.",
         )
     else:
         ticker = st.text_input(

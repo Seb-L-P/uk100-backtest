@@ -99,20 +99,34 @@ class OpeningRangeBreakout:
         if broker.position is not None or self._traded_today:
             return Signal(action="noop")
 
-        # First-fill-wins: if one of our pending stops filled and is no longer
-        # in the broker's pending list, cancel its sibling so we don't open
-        # the opposite trade later.
+        # First-fill-wins. Three resolution cases:
+        #   (a) exactly one order died → cancel the sibling, mark traded
+        #   (b) BOTH died on the same bar (rare: one filled, the other was
+        #       dropped because max_concurrent was reached) → just clear
+        #       state and mark traded. Without this the tracking IDs stuck
+        #       at non-None values would still let the strategy think it
+        #       has a pending order pair, but the "stops_armed" guard does
+        #       the heavy lifting downstream so the impact is limited; we
+        #       still set _traded_today for consistency.
+        #   (c) neither died → leave both alone.
         live = {o.id for o in broker.pending_orders}
         if self._stops_armed:
             up_dead = self._stop_up_id is not None and self._stop_up_id not in live
             dn_dead = self._stop_dn_id is not None and self._stop_dn_id not in live
-            if up_dead and self._stop_dn_id in live:
+            if up_dead and dn_dead:
+                # Both gone — likely both fired same bar, one dropped.
+                self._stop_up_id = None
+                self._stop_dn_id = None
+                self._traded_today = True
+            elif up_dead and self._stop_dn_id in live:
                 broker.cancel_pending_order(self._stop_dn_id)
                 self._stop_dn_id = None
+                self._stop_up_id = None
                 self._traded_today = True
             elif dn_dead and self._stop_up_id in live:
                 broker.cancel_pending_order(self._stop_up_id)
                 self._stop_up_id = None
+                self._stop_dn_id = None
                 self._traded_today = True
 
         # Build the opening range as the first N bars

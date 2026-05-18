@@ -269,6 +269,6 @@ class _NullMTF:
 _NULL_MTF = _NullMTF()
 
 
-# The richer "confluence" system lives in backtest/confluence.py. It
-# replaces the older HtfFilterWrapper approach with a much more flexible
-# scoring + risk-scaling design.
+# Strategy-composition lives in backtest/graph.py — DecisionGraph +
+# GraphOrchestrator. They use this MTFContext for look-ahead-safe HTF
+# lookups but own the trigger/supporter/veto wiring themselves.

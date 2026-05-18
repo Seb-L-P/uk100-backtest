@@ -34,9 +34,9 @@ from strategies.engulfing import EngulfingReversal
 from strategies.inside_bar import InsideBarBreakout
 from strategies.heikin_ashi_trend import HeikinAshiTrend
 from strategies.triple_ema import TripleEma
-# ensemble.py is no longer used by the registry; the decision-graph
-# framework supersedes it. Tests may still import from strategies.ensemble
-# directly, which continues to work.
+# NOTE: strategy composition (the old vote/filter ensembles) now lives in
+# the decision-graph framework — backtest/graph.py. The registry only holds
+# atomic strategies.
 
 
 ParamType = Literal["int", "float", "bool"]
@@ -497,13 +497,6 @@ STRATEGIES: dict[str, StrategySpec] = {
         ],
     ),
 
-    # ---- ENSEMBLES (removed) -------------------------------------------
-    # The old vote/filter ensemble entries have been replaced by the
-    # decision-graph framework in backtest/graph.py. To replicate them:
-    #   - vote_meanrev = trigger:bb_revert + supporters:[rsi_revert, vwap_revert]
-    #   - vote_trend   = trigger:donchian + supporter:sma
-    #   - filter_fvg_rsi = trigger:fvg + veto:rsi_revert
-    # Build any of these via the graph builder UI and save as a preset.
 }
 
 

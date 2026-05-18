@@ -141,10 +141,12 @@ def _intraday_range(interval: str, num_points: int) -> tuple[int, int]:
     # Wall clock minutes needed = (bars × bar minutes) × calendar-to-trading ratio
     wall_clock_minutes = num_points * minutes_per_bar * 5
     # Floor: 7 days (so weekend runs always include at least one trading session)
-    # Ceiling: 30 years (EODHD's max intraday coverage)
-    THIRTY_YEARS_MIN = 30 * 365 * 24 * 60
+    # Ceiling: 40 years (EODHD's practical max intraday coverage; the chunked
+    # fetcher stops walking earlier when EODHD returns empty chunks anyway,
+    # so this is just a safety cap).
+    FORTY_YEARS_MIN = 40 * 365 * 24 * 60
     SEVEN_DAYS_MIN = 7 * 24 * 60
-    wall_clock_minutes = max(SEVEN_DAYS_MIN, min(wall_clock_minutes, THIRTY_YEARS_MIN))
+    wall_clock_minutes = max(SEVEN_DAYS_MIN, min(wall_clock_minutes, FORTY_YEARS_MIN))
     from_ts = to_ts - wall_clock_minutes * 60
     return from_ts, to_ts
 

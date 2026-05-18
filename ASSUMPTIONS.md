@@ -39,15 +39,26 @@ reality lives.
 
 ### Execution model
 
-- **Stops fill at exact level**. Real stops "slip past" the level — your
-  fill may be 1-3pts worse than your stop price, especially during news
-  spikes. Our 0.5pt slippage understates this in stressed conditions.
-- **Take-profits fill at exact level**. Same issue; this one's usually in
-  your favour so the under-modelling is more conservative.
-- **Bar-by-bar resolution**. Intrabar dynamics are invisible. A 15-minute
-  bar that swung high→low→high→low looks like just OHLC to us. If your
-  strategy depends on intrabar order (e.g. "stop must hit BEFORE target"),
-  we may get the answer wrong.
+- **Gap-aware SL/TP fills**. When a bar's OPEN has already crossed the
+  stop or target level, we fill at `bar.Open` (worse than the level for
+  stops, better than the level for targets) plus slippage where
+  applicable. This is closer to real broker behaviour than the older
+  "always fill at the level" model. Slippage on stops still scales with
+  bar spread; the floor is `min_slippage_points`.
+- **Same-bar SL/TP after limit fills**. When a pending limit/stop opens a
+  position mid-bar, the bar's continuing range is checked against the
+  new position's SL/TP immediately. Without this, the next bar's gap-fill
+  logic would fire and inflate losses.
+- **Limit fills use favourable price**. If a long limit at 100 sees the
+  bar open at 98, we fill at 98 (a real broker gives you the better
+  price). Stop orders mirror this with slippage on the unfavourable side.
+- **Bar-by-bar resolution**. Intrabar dynamics are invisible. A 15-min
+  bar that swung high→low→high→low looks like just OHLC to us. We
+  conservatively assume STOP fires first when both SL and TP fall inside
+  one bar's range — worst case for the trader. This is why we recommend
+  trigger-TF decoupling (data at 1m, trigger at 15m) for strategies
+  where intrabar ordering matters: fills resolve at 1m precision while
+  strategy decisions stay on 15m closes.
 
 ### Data quality
 

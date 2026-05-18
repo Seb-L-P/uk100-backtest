@@ -47,16 +47,28 @@ class InsideBarBreakout:
                 self._sell_stop_id = None
             self._inside_bar_index = -1
 
-        # If one side filled, cancel the other (first-fill-wins)
+        # First-fill-wins. Three cases:
+        #   (a) exactly one side died → cancel the other.
+        #   (b) BOTH died same bar (one filled, the other dropped by
+        #       max_concurrent_positions) → clear state so the strategy
+        #       can detect a new inside bar on a future bar. Without this
+        #       the IDs would stick at non-None and the early-return at
+        #       line ~66 would block ALL future entries for the run.
+        #   (c) neither died → leave both alone.
         live = {o.id for o in broker.pending_orders}
-        if (self._buy_stop_id and self._buy_stop_id not in live
-                and self._sell_stop_id and self._sell_stop_id in live):
+        buy_dead = bool(self._buy_stop_id) and self._buy_stop_id not in live
+        sell_dead = bool(self._sell_stop_id) and self._sell_stop_id not in live
+        if buy_dead and sell_dead:
+            # Both gone — likely both fired same bar, one dropped.
+            self._buy_stop_id = None
+            self._sell_stop_id = None
+            self._inside_bar_index = -1
+        elif buy_dead and self._sell_stop_id in live:
             broker.cancel_pending_order(self._sell_stop_id)
             self._sell_stop_id = None
             self._buy_stop_id = None
             self._inside_bar_index = -1
-        elif (self._sell_stop_id and self._sell_stop_id not in live
-              and self._buy_stop_id and self._buy_stop_id in live):
+        elif sell_dead and self._buy_stop_id in live:
             broker.cancel_pending_order(self._buy_stop_id)
             self._buy_stop_id = None
             self._sell_stop_id = None

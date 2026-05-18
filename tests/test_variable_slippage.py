@@ -106,14 +106,34 @@ def test_stop_sell_order_uses_variable_slippage():
 
 
 def test_limit_orders_never_apply_slippage():
-    """Limit orders fill AT the limit price — no slippage applied."""
+    """
+    Limit orders never get slippage. They fill at the trigger when the bar
+    reaches the trigger from the unfavourable side, OR at bar.Open when the
+    bar opens past the trigger in the FAVOURABLE direction (better price —
+    you'd never pay the trigger when the market opens better).
+    """
+    # --- Case 1: bar wandered DOWN to the long limit from above ---
+    # Open above the limit means we need bar.Low to reach the trigger.
+    # Fill should be exactly at the trigger, with no slippage.
     broker = Broker()
     t = datetime(2024, 1, 1, 9, 0)
     broker.place_pending_order(
         side="long", order_type="limit", trigger_price=100.0,
         stake_per_point=1.0, time=t,
     )
+    bar = {"Open": 102, "High": 103, "Low": 99, "Close": 101, "Spread": 4.0}
+    opened = broker.check_pending_orders(t, bar, bar_spread=4.0)
+    assert opened[0].entry_price == pytest.approx(100.0)
+
+    # --- Case 2: bar opens BELOW the long limit (favourable) ---
+    # The market opened at a price BETTER than our limit — a real broker
+    # would fill us immediately at the gap-open price (99), not at the
+    # limit (100). No slippage applied either way.
+    broker = Broker()
+    broker.place_pending_order(
+        side="long", order_type="limit", trigger_price=100.0,
+        stake_per_point=1.0, time=t,
+    )
     bar = {"Open": 99, "High": 101, "Low": 95, "Close": 100, "Spread": 4.0}
     opened = broker.check_pending_orders(t, bar, bar_spread=4.0)
-    # Limit fills at trigger exactly, not trigger ± slippage
-    assert opened[0].entry_price == pytest.approx(100.0)
+    assert opened[0].entry_price == pytest.approx(99.0)
