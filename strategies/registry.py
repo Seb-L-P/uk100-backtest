@@ -34,6 +34,12 @@ from strategies.engulfing import EngulfingReversal
 from strategies.inside_bar import InsideBarBreakout
 from strategies.heikin_ashi_trend import HeikinAshiTrend
 from strategies.triple_ema import TripleEma
+from strategies.pivot_reversal import PivotReversal
+from strategies.adx_trend import AdxTrend
+from strategies.psar_flip import ParabolicSarFlip
+from strategies.keltner_breakout import KeltnerBreakout
+from strategies.overnight_range import OvernightRangeBreakout
+from strategies.mfi_extremes import MfiExtremes
 # NOTE: strategy composition (the old vote/filter ensembles) now lives in
 # the decision-graph framework — backtest/graph.py. The registry only holds
 # atomic strategies.
@@ -494,6 +500,166 @@ STRATEGIES: dict[str, StrategySpec] = {
             ParamSpec("atr_period", "ATR period", "int", default=14, min=5, max=50, step=1),
             ParamSpec("atr_stop_mult", "ATR stop multiplier", "float",
                       default=2.0, min=0.5, max=5.0, step=0.25),
+        ],
+    ),
+
+    # ---- Phase 15 additions --------------------------------------------
+    "pivot_reversal": StrategySpec(
+        key="pivot_reversal",
+        label="Pivot reversal (S1/R1 fade)",
+        cls=PivotReversal,
+        warmup_bars=20,
+        description=(
+            "Day-trade. At session open, compute classic floor-trader pivots "
+            "from yesterday's H/L/C. Arm limit BUY at S1 and limit SELL at R1. "
+            "Stop past S2/R2, target the central pivot P. First-fill-wins; "
+            "flat by session close."
+        ),
+        params=[
+            ParamSpec("stop_buffer_atr_mult", "Stop buffer (× ATR)", "float",
+                      default=0.3, min=0.0, max=2.0, step=0.05,
+                      help="Cushion past S2/R2 for stop placement."),
+            ParamSpec("atr_period", "ATR period", "int",
+                      default=14, min=5, max=50, step=1),
+            ParamSpec("max_age_bars", "Max order age (bars)", "int",
+                      default=20, min=2, max=80, step=1,
+                      help="Cancel unfilled limits after this many bars."),
+        ],
+    ),
+    "adx_trend": StrategySpec(
+        key="adx_trend",
+        label="ADX-filtered SMA trend",
+        cls=AdxTrend,
+        warmup_bars=55,
+        description=(
+            "SMA crossover GATED by ADX > threshold and +DI/-DI directional "
+            "agreement. Only takes trend trades when ADX confirms an actual "
+            "trend is present. Helps avoid the classic SMA-crossover chop pain."
+        ),
+        params=[
+            ParamSpec("fast", "Fast SMA period", "int", default=20, min=5, max=100, step=1),
+            ParamSpec("slow", "Slow SMA period", "int", default=50, min=20, max=300, step=5),
+            ParamSpec("adx_period", "ADX period", "int", default=14, min=5, max=50, step=1),
+            ParamSpec("adx_threshold", "ADX min threshold", "float",
+                      default=25.0, min=10.0, max=50.0, step=1.0,
+                      help="ADX must be ≥ this to take the cross. 20-25 typical."),
+            ParamSpec("atr_period", "ATR period", "int", default=14, min=5, max=50, step=1),
+            ParamSpec("atr_stop_mult", "ATR stop multiplier", "float",
+                      default=2.0, min=0.5, max=5.0, step=0.25),
+            ParamSpec("r_target", "Target (R)", "float",
+                      default=2.0, min=0.5, max=5.0, step=0.25),
+        ],
+    ),
+    "psar_flip": StrategySpec(
+        key="psar_flip",
+        label="Parabolic SAR flip",
+        cls=ParabolicSarFlip,
+        warmup_bars=30,
+        description=(
+            "Welles Wilder's stop-and-reverse system. Enter on SAR flip, "
+            "stop at current SAR value, exit on opposite flip. Optional ADX "
+            "filter to skip flips in chop."
+        ),
+        params=[
+            ParamSpec("af_start", "AF start (acceleration)", "float",
+                      default=0.02, min=0.005, max=0.1, step=0.005,
+                      help="Initial acceleration factor. Wilder's default 0.02."),
+            ParamSpec("af_step", "AF step", "float",
+                      default=0.02, min=0.005, max=0.1, step=0.005),
+            ParamSpec("af_max", "AF max", "float",
+                      default=0.2, min=0.05, max=0.5, step=0.05),
+            ParamSpec("stop_buffer_atr_mult", "Stop buffer (× ATR)", "float",
+                      default=0.1, min=0.0, max=1.0, step=0.05),
+            ParamSpec("atr_period", "ATR period", "int",
+                      default=14, min=5, max=50, step=1),
+            ParamSpec("adx_min", "ADX gate (0 = off)", "float",
+                      default=0.0, min=0.0, max=50.0, step=1.0,
+                      help="Skip SAR flips when ADX is below this. 0 disables the filter."),
+            ParamSpec("adx_period", "ADX period", "int",
+                      default=14, min=5, max=50, step=1),
+        ],
+    ),
+    "keltner_break": StrategySpec(
+        key="keltner_break",
+        label="Keltner channel breakout",
+        cls=KeltnerBreakout,
+        warmup_bars=35,
+        description=(
+            "Trend-continuation: enter LONG when close breaks above the Keltner "
+            "upper channel (EMA + ATR mult), SHORT on lower break. Stop at the "
+            "channel midline, target an R-multiple. Smoother than BB breakout "
+            "because the bands ride ATR not std-dev."
+        ),
+        params=[
+            ParamSpec("ema_period", "EMA period (midline)", "int",
+                      default=20, min=5, max=100, step=1),
+            ParamSpec("atr_period", "ATR period (band width)", "int",
+                      default=10, min=5, max=50, step=1),
+            ParamSpec("mult", "Channel multiplier", "float",
+                      default=2.0, min=1.0, max=4.0, step=0.25,
+                      help="Bands = EMA ± mult × ATR."),
+            ParamSpec("stop_buffer_atr_mult", "Stop buffer (× ATR)", "float",
+                      default=0.2, min=0.0, max=2.0, step=0.05),
+            ParamSpec("r_target", "Target (R)", "float",
+                      default=2.0, min=0.5, max=5.0, step=0.25),
+        ],
+    ),
+    "overnight_range": StrategySpec(
+        key="overnight_range",
+        label="Overnight range breakout",
+        cls=OvernightRangeBreakout,
+        warmup_bars=30,
+        description=(
+            "Day-trade. At today's session open, arm pending stop orders at "
+            "the high (long) and low (short) of the previous N bars. Captures "
+            "gap-and-go moves and breaks of yesterday's range. One trade per day."
+        ),
+        params=[
+            ParamSpec("lookback_bars", "Lookback bars (prior session)", "int",
+                      default=30, min=5, max=200, step=5,
+                      help="How many bars before today's first session bar to scan for the overnight high/low."),
+            ParamSpec("stop_buffer_atr_mult", "Stop buffer (× ATR)", "float",
+                      default=0.3, min=0.0, max=2.0, step=0.05),
+            ParamSpec("r_target", "Target (R)", "float",
+                      default=2.0, min=0.5, max=5.0, step=0.25),
+            ParamSpec("atr_period", "ATR period", "int",
+                      default=14, min=5, max=50, step=1),
+            ParamSpec("max_age_bars", "Pending order max age (bars)", "int",
+                      default=12, min=2, max=60, step=1,
+                      help="Cancel unfilled stops after this many bars."),
+        ],
+    ),
+    "mfi_extremes": StrategySpec(
+        key="mfi_extremes",
+        label="MFI extremes mean reversion",
+        cls=MfiExtremes,
+        warmup_bars=25,
+        description=(
+            "Volume-weighted RSI cousin. Long when MFI dipped oversold then "
+            "hooks up; short on overbought hook down. Exit when MFI crosses "
+            "back through 50 or stop/target. Note: volume here is the index "
+            "underlying volume from Yahoo — a proxy, not your broker's flow."
+        ),
+        params=[
+            ParamSpec("mfi_period", "MFI period", "int",
+                      default=14, min=2, max=50, step=1),
+            ParamSpec("oversold", "Oversold threshold", "float",
+                      default=20.0, min=5.0, max=40.0, step=1.0),
+            ParamSpec("overbought", "Overbought threshold", "float",
+                      default=80.0, min=60.0, max=95.0, step=1.0),
+            ParamSpec("exit_level", "Exit MFI level", "float",
+                      default=50.0, min=40.0, max=60.0, step=1.0),
+            ParamSpec("atr_period", "ATR period", "int",
+                      default=14, min=5, max=50, step=1),
+            ParamSpec("atr_stop_mult", "ATR stop multiplier", "float",
+                      default=2.0, min=0.5, max=5.0, step=0.25),
+            ParamSpec("stop_buffer_atr_mult", "Stop buffer (× ATR)", "float",
+                      default=0.1, min=0.0, max=2.0, step=0.05),
+            ParamSpec("r_target", "Target (R)", "float",
+                      default=2.0, min=0.5, max=5.0, step=0.25),
+            ParamSpec("lookback_for_extreme", "Hook lookback (bars)", "int",
+                      default=5, min=2, max=20, step=1,
+                      help="How recently MFI must have hit the extreme before the hook."),
         ],
     ),
 

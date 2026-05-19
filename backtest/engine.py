@@ -321,6 +321,16 @@ def _gap_invalidates(side: str, fill_price: float,
     return False
 
 
+def _position_open(broker: Broker, position_id: str) -> bool:
+    """
+    True if the broker still has an open position with that id. Used by
+    close/scale_out signal handlers to silently skip stale signals — the
+    position may have closed via stops/targets on the same bar the strategy
+    emitted the signal.
+    """
+    return any(p.id == position_id for p in broker.positions)
+
+
 def _apply_signal(signal: Signal, broker: Broker, time, price: float,
                   entry_spread_pts: float | None = None) -> None:
     """
@@ -376,19 +386,33 @@ def _apply_signal(signal: Signal, broker: Broker, time, price: float,
         if signal.replace_all and broker.positions:
             broker.close_all(time, price, reason="reverse",
                              exit_spread_pts=entry_spread_pts)
-        broker.open(
-            side, signal.stake_per_point, time, price,
-            stop_loss=signal.stop_loss, take_profit=signal.take_profit,
-            trailing_stop_fn=signal.trailing_stop_fn,
-            entry_spread_pts=entry_spread_pts,
-            entry_metadata=getattr(signal, "metadata", None),
-        )
+        try:
+            broker.open(
+                side, signal.stake_per_point, time, price,
+                stop_loss=signal.stop_loss, take_profit=signal.take_profit,
+                trailing_stop_fn=signal.trailing_stop_fn,
+                entry_spread_pts=entry_spread_pts,
+                entry_metadata=getattr(signal, "metadata", None),
+            )
+        except (ValueError, RuntimeError):
+            # Mirrors the pending-order path's leverage / max-positions handling
+            # in broker._fill_pending_orders. By the time a market-order signal
+            # reaches its fill bar, balance may have dropped (other positions
+            # stopped out, financing) so the stake sized at signal time no
+            # longer fits within the leverage cap. Real brokers reject; we
+            # count the drop and continue rather than crashing the backtest.
+            broker._dropped_order_count += 1
 
     elif signal.action == "close":
         if signal.position_id is not None:
-            broker.close(signal.position_id, time, price,
-                         reason=signal.reason or "signal",
-                         exit_spread_pts=entry_spread_pts)
+            # The position may have been closed by stops/targets on the
+            # SAME bar the strategy emitted the close signal. Silent no-op.
+            # Don't increment a counter — close-on-already-closed isn't an
+            # order drop, it's just a one-bar lag between strategy and broker.
+            if _position_open(broker, signal.position_id):
+                broker.close(signal.position_id, time, price,
+                             reason=signal.reason or "signal",
+                             exit_spread_pts=entry_spread_pts)
         elif broker.positions:
             broker.close_all(time, price, reason=signal.reason or "signal",
                              exit_spread_pts=entry_spread_pts)
@@ -396,9 +420,10 @@ def _apply_signal(signal: Signal, broker: Broker, time, price: float,
     elif signal.action == "close_position":
         if signal.position_id is None:
             raise ValueError("close_position requires position_id")
-        broker.close(signal.position_id, time, price,
-                     reason=signal.reason or "signal",
-                     exit_spread_pts=entry_spread_pts)
+        if _position_open(broker, signal.position_id):
+            broker.close(signal.position_id, time, price,
+                         reason=signal.reason or "signal",
+                         exit_spread_pts=entry_spread_pts)
 
     elif signal.action == "close_all":
         if broker.positions:
@@ -408,10 +433,15 @@ def _apply_signal(signal: Signal, broker: Broker, time, price: float,
     elif signal.action == "scale_out":
         if signal.position_id is None or signal.scale_fraction is None:
             raise ValueError("scale_out requires position_id and scale_fraction")
-        broker.scale_out(signal.position_id, time, price,
-                         fraction=signal.scale_fraction,
-                         reason=signal.reason or "scale_out",
-                         exit_spread_pts=entry_spread_pts)
+        # FvgScaleOut and similar emit a scale_out signal when price hits 1R,
+        # but the position may have hit its full target or stop in the SAME
+        # bar the signal was generated — the broker's pre-signal check_stops
+        # already closed it. Treat as a stale signal and skip.
+        if _position_open(broker, signal.position_id):
+            broker.scale_out(signal.position_id, time, price,
+                             fraction=signal.scale_fraction,
+                             reason=signal.reason or "scale_out",
+                             exit_spread_pts=entry_spread_pts)
 
     elif signal.action == "cancel_order":
         if signal.cancel_order_id is None:

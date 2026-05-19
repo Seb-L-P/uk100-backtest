@@ -207,9 +207,16 @@ class MTFContext:
 
     @staticmethod
     def _period(interval: str) -> pd.Timedelta:
-        """Convert an interval string ('1h', '4h', '1d') to a Timedelta."""
+        """Convert an interval string ('1h', '4h', '1d') to a Timedelta.
+
+        Note: must NOT go via `pd.tseries.frequencies.to_offset(rule)` →
+        `pd.Timedelta()` — newer pandas (≥2.2) refuses to convert a
+        DateOffset like `<Day>` directly to Timedelta. Pass the rule
+        STRING to Timedelta, which handles all our fixed-period rules
+        ("1min", "15min", "1h", "1D", "1W") natively.
+        """
         rule = _RESAMPLE_RULE.get(interval, interval)
-        return pd.Timedelta(pd.tseries.frequencies.to_offset(rule))
+        return pd.Timedelta(rule)
 
     def _htf_indicator(self, interval: str, name: str, *args) -> pd.Series | None:
         """

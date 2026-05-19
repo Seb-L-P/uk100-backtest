@@ -119,25 +119,35 @@ def _cache_path(symbol: str, interval: str, num_points: int) -> Path:
     #   v2: added proxy price scaling (UK100→ISF.LSE ×10)
     #   v3: added trading-tz conversion on fetch (Apr 2026)
     safe = symbol.replace(".", "_").replace("^", "")
-    return DATA_CACHE / f"eodhd_v3_{safe}_{interval}_{num_points}pts.parquet"
+    # v4: fixed the _intraday_range bug where 15m/30m fetches asked for only
+    # 1/3 to 1/6 of the expected wall-clock range. Old v3 caches are stale.
+    return DATA_CACHE / f"eodhd_v4_{safe}_{interval}_{num_points}pts.parquet"
 
 
 # ---- Date helpers ------------------------------------------------------
 def _intraday_range(interval: str, num_points: int) -> tuple[int, int]:
     """
     Compute (from_ts, to_ts) for an intraday fetch, given the desired number
-    of bars at the resolution. Returns UNIX seconds.
+    of bars at the OUTPUT resolution. Returns UNIX seconds.
 
     Notes:
+      - `interval` is the OUTPUT interval the user wants — even if we fetch
+        it natively from a different EODHD endpoint (e.g. 15m is resampled
+        from native 5m, but the user wants `num_points` 15m bars at the end).
+        Using the native minutes here was a long-standing bug: for a 15m
+        request of 3744 bars the function asked for 3744 × 5min = ~65 days
+        of wall-clock data, then resampled to ~1248 15m bars. The user saw
+        a third of what they expected. Now keyed on the OUTPUT bar minutes.
       - Liquid intraday markets trade ~6.5-8h/day, ~252 days/year, so calendar
         time is ~5x longer than trading time. We use 5x as the safety factor.
       - The chunked fetcher walks back in 599-day windows and stops early when
         EODHD returns no data (i.e. we've gone past the asset's history start).
         So overshooting `from_ts` is harmless.
-      - Capped at 30 years which is EODHD's maximum coverage for most assets.
+      - Capped at 40 years which is EODHD's maximum coverage for most assets.
     """
     to_ts = int(dt.datetime.now().timestamp())
-    minutes_per_bar = {"1m": 1, "5m": 5, "15m": 5, "30m": 5, "1h": 60}.get(interval, 1)
+    # Use the OUTPUT interval's bar minutes — not the native fetch interval.
+    minutes_per_bar = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "1h": 60}.get(interval, 1)
     # Wall clock minutes needed = (bars × bar minutes) × calendar-to-trading ratio
     wall_clock_minutes = num_points * minutes_per_bar * 5
     # Floor: 7 days (so weekend runs always include at least one trading session)

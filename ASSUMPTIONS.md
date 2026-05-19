@@ -52,6 +52,16 @@ reality lives.
 - **Limit fills use favourable price**. If a long limit at 100 sees the
   bar open at 98, we fill at 98 (a real broker gives you the better
   price). Stop orders mirror this with slippage on the unfavourable side.
+- **Leverage cap re-checked at FILL time**. A stake sized at signal time
+  may no longer fit within the leverage cap if the account drew down
+  between signal and fill. The engine catches the rejection and skips
+  the trade (incrementing `broker._dropped_order_count`) rather than
+  crashing the run. Real brokers reject under-margined orders the same
+  way.
+- **Stale close/scale_out signals**. A strategy may emit a `close` or
+  `scale_out` signal on the same bar a position's stop/target already
+  closed it. The engine checks `_position_open(broker, position_id)`
+  and silently skips stale signals instead of raising.
 - **Bar-by-bar resolution**. Intrabar dynamics are invisible. A 15-min
   bar that swung high→low→high→low looks like just OHLC to us. We
   conservatively assume STOP fires first when both SL and TP fall inside

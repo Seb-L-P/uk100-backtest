@@ -21,8 +21,12 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent
 DATA_CACHE = PROJECT_ROOT / "data" / "cache"
 REPORTS_DIR = PROJECT_ROOT / "reports"
+# Saved sweep results (top candidates as JSON) so the user can pick them
+# up later in the validation / refinement pages. One file per saved sweep.
+SAVED_SWEEPS_DIR = PROJECT_ROOT / "saved_sweeps"
 DATA_CACHE.mkdir(parents=True, exist_ok=True)
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+SAVED_SWEEPS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # --- Cost model ---------------------------------------------------------
