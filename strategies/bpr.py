@@ -227,6 +227,14 @@ class BalancedPriceRange:
             expires_after_bars=self.max_bpr_age,
         )
         self._bpr_to_order_id[bpr.creator_bar_index] = order.id
+        # One shot per BPR. Without this, after a same-bar fill+stop the BPR
+        # remains in self._bprs, price is still inside the zone next bar, and
+        # the candidates loop re-arms the same limit — a wash-trade loop that
+        # produced 60%+ same-bar in-and-out on the verification scenarios.
+        try:
+            self._bprs.remove(bpr)
+        except ValueError:
+            pass
         return Signal(action="noop",
                       reason=(f"BPR limit armed: size={bpr.size_points:.1f}, "
                               f"approach={'down' if net_move<0 else 'up'}"))

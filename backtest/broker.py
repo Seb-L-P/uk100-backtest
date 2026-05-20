@@ -254,6 +254,28 @@ class Broker:
                     f"Invalid target geometry: SHORT entry at {price:.4f} with "
                     f"take_profit={take_profit:.4f} (must be below entry)."
                 )
+        # Stop-too-close check. Catches the case where a limit fills at a
+        # favourable price (bar.Open well past trigger) that compresses
+        # planned risk down to less than one spread crossing. Example:
+        # FvgScaleOut placed a long limit at 10160 with stop at 10148.66
+        # (planned risk 11.3pt); bar.Open gapped down to 10149.96, filling
+        # the limit but leaving only 1.3pt of risk above the stop — guaranteed
+        # near-1R loser on intra-bar noise. Engine's _apply_signal already
+        # catches the equivalent on market fills; this is the pending-order
+        # path.
+        if stop_loss is not None:
+            risk_pts = abs(price - stop_loss)
+            try:
+                min_viable = self.costs.effective_spread_pts(price=price)
+            except Exception:
+                min_viable = 0.0
+            if risk_pts < min_viable:
+                raise ValueError(
+                    f"Stop too close to entry: {side.upper()} at {price:.4f} "
+                    f"with stop_loss={stop_loss:.4f} (risk {risk_pts:.4f}pt < "
+                    f"one-spread {min_viable:.4f}pt). Pending limit likely "
+                    f"filled at a favourable gap that crushed planned risk."
+                )
 
         # Validate leverage against TOTAL notional (existing + new)
         new_notional = stake_per_point * price

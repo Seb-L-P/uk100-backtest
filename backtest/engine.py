@@ -307,12 +307,27 @@ def _gap_invalidates(side: str, fill_price: float,
     """
     True iff the actual fill price has moved past the strategy's stop or
     target, so the geometry of the trade is broken. Caller should skip.
+
+    Also true if the gap has SQUEEZED the stop closer than one spread of
+    fill_price — risk is structurally insufficient. Without this, a signal
+    that planned, say, a 5-pt stop can fill after an overnight gap with
+    only 0.03pt of risk remaining, and the next intrabar noise spike
+    closes it for a near-1R loss on what looked like a normal setup.
+    Verification flagged this on AAPL ha_trend (Apr 22, 14:30 open
+    gapped 1.65pt past the 21:00 prior close used to size the stop).
     """
     if stop_loss is not None:
         if side == "long" and stop_loss >= fill_price:
             return True
         if side == "short" and stop_loss <= fill_price:
             return True
+        try:
+            import config as _config
+            min_viable = _config.COSTS.effective_spread_pts(price=fill_price)
+            if abs(fill_price - stop_loss) < min_viable:
+                return True
+        except Exception:
+            pass
     if take_profit is not None:
         if side == "long" and take_profit <= fill_price:
             return True

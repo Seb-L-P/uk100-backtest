@@ -40,10 +40,27 @@ def risk_based_stake(equity_gbp: float, risk_pts: float,
              With `price=10200`, function caps to ~£19.6/pt = £200k notional.
              Effective risk drops to £19.6 × 4pt = £78 instead of £100.
              Better to take a smaller-than-planned trade than crash the run.
+
+    Returns 0 (caller treats as "skip trade") when `risk_pts` is below the
+    active cost profile's one-way spread cost — taking such a trade can't
+    profit even on a clean tag, since one spread crossing exceeds the risk.
+    Verification flagged trades on AAPL ha_trend and UK100 fvg_scale_out
+    where ATR collapsed and the strategy issued a stop within slippage of
+    entry. The fix is here, not in each strategy.
     """
     risk_pct = risk_pct if risk_pct is not None else ACCOUNT.risk_per_trade_pct
     if risk_pts <= 0:
         return 0.0
+    # Spread-coverage gate: if the stop is tighter than one side of the
+    # spread, the trade is structurally unviable.
+    if price is not None and price > 0:
+        try:
+            import config as _config
+            min_viable = _config.COSTS.effective_spread_pts(price=price)
+            if risk_pts < min_viable:
+                return 0.0
+        except Exception:
+            pass
     risk_gbp = equity_gbp * risk_pct
     stake = max(min_stake, round(risk_gbp / risk_pts, 2))
 
