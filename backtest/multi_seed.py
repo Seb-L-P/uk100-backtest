@@ -102,6 +102,7 @@ def run_multi_seed(
     warmup_bars: int = 50,
     costs=None,
     progress_callback: Callable[[float, str], None] | None = None,
+    n_jobs: int | None = None,
 ) -> MultiSeedResult:
     """
     Run `run_sweep` once per seed in `seeds`, then aggregate results by
@@ -109,6 +110,10 @@ def run_multi_seed(
 
     Progress callback receives normalised progress across ALL seeds —
     so a 4-seed run feeds the bar 0%, 25%, 50%, 75%, 100% boundaries.
+
+    `n_jobs` is forwarded to each per-seed `run_sweep` (None = auto-detect
+    `os.cpu_count() - 1` workers), so multi-seed runs parallelise the
+    trials within each seed. Seeds themselves run sequentially.
     """
     if not seeds:
         raise ValueError("Need at least one seed")
@@ -132,7 +137,7 @@ def run_multi_seed(
             n_trials=n_trials, is_ratio=is_ratio, val_ratio=val_ratio,
             top_k=top_k, top_m=top_m, min_trades=min_trades,
             warmup_bars=warmup_bars, costs=costs, seed=seed,
-            progress_callback=_inner_cb,
+            progress_callback=_inner_cb, n_jobs=n_jobs,
         )
         seed_runs.append(SeedRun(seed=seed, result=result))
 

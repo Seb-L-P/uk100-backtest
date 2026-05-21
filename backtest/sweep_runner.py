@@ -21,11 +21,34 @@ message in `disqualified_reason`, so the leaderboard still tells you what
 went wrong.
 
 Reproducibility: pass `seed` to get bit-identical results across runs.
+
+Parallelism
+-----------
+Each stage is embarrassingly parallel: a trial is a pure function of
+(graph, split, costs). The runner can fan trials out across a
+`ProcessPoolExecutor` (`n_jobs` > 1) without affecting results.
+
+The one thing that MUST stay serial is graph *sampling* — `sample_random_graph`
+consumes the shared RNG in a strict order, so identical seeds only give
+identical graphs if drawn one after another on a single thread. We
+therefore split the two concerns: all N graphs are sampled serially up
+front on the main process, then the (pure) backtests are dispatched to
+the pool. Results are reassembled in trial order before sorting, so the
+final leaderboard is bit-identical to the serial path for the same seed —
+regardless of `n_jobs` or the order workers happen to finish in.
+
+The read-only `data` splits and `costs` are shipped to each worker ONCE
+via the pool `initializer` (stored in a per-process global), not re-pickled
+per task. Per-trial crashes are caught inside the worker exactly as in the
+serial path (`_run_one_trial` never raises), so one bad graph can't take
+down a worker or the sweep.
 """
 from __future__ import annotations
 
 import logging
+import os
 import traceback
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
@@ -174,6 +197,93 @@ def _run_one_trial(
         )
 
 
+# ---- Parallel execution plumbing ---------------------------------------
+# A pool worker keeps the read-only splits + costs in this per-process
+# global, populated once by `_pool_init` when the worker starts. We never
+# mutate it, so there's no cross-task contamination.
+_WORKER_STATE: dict = {}
+
+
+def _pool_init(splits, costs, starting_balance, warmup_bars) -> None:
+    """ProcessPoolExecutor initializer: stash the read-only run context.
+
+    Called once per worker process at pool startup. The (potentially large)
+    split DataFrames and the cost model are pickled to each worker exactly
+    once here, instead of being re-shipped with every task.
+    """
+    _WORKER_STATE["splits"] = splits
+    _WORKER_STATE["costs"] = costs
+    _WORKER_STATE["starting_balance"] = starting_balance
+    _WORKER_STATE["warmup_bars"] = warmup_bars
+
+
+def _pool_worker(key, graph: DecisionGraph, split_name: str, min_trades: int):
+    """Run one trial inside a pool worker, reading context from the global.
+
+    Returns `(key, TrialMetrics)`. `_run_one_trial` swallows trial-level
+    exceptions, so this never raises for a bad graph — the metrics carry the
+    `disqualified_reason` instead.
+    """
+    s = _WORKER_STATE
+    metrics = _run_one_trial(
+        graph, s["splits"][split_name], s["costs"],
+        starting_balance=s["starting_balance"],
+        min_trades=min_trades,
+        warmup_bars=s["warmup_bars"],
+    )
+    return key, metrics
+
+
+def _resolve_n_jobs(n_jobs: Optional[int]) -> int:
+    """Resolve the worker count. None → cpu_count()-1 (leave a core for the OS)."""
+    if n_jobs is None:
+        return max(1, (os.cpu_count() or 2) - 1)
+    return max(1, int(n_jobs))
+
+
+def _execute_stage(
+    tasks: list[tuple],
+    splits: dict,
+    costs,
+    starting_balance: float,
+    warmup_bars: int,
+    executor: Optional[ProcessPoolExecutor],
+    on_done: Callable[[int], None],
+) -> dict:
+    """Run a stage's trials, serially or on the pool, returning {key: metrics}.
+
+    `tasks` is a list of `(key, graph, split_name, min_trades)`. `on_done(n)`
+    fires once per COMPLETED trial with the running count within this stage —
+    when parallel, that's in completion order (via `as_completed`), not
+    submission order, so the progress bar advances as work actually finishes.
+    Results are keyed so the caller can reassemble in deterministic order.
+    """
+    results: dict = {}
+    done = 0
+    if executor is None:
+        for key, graph, split_name, min_trades in tasks:
+            results[key] = _run_one_trial(
+                graph, splits[split_name], costs,
+                starting_balance=starting_balance,
+                min_trades=min_trades,
+                warmup_bars=warmup_bars,
+            )
+            done += 1
+            on_done(done)
+        return results
+
+    fut_to_key = {
+        executor.submit(_pool_worker, key, graph, split_name, min_trades): key
+        for key, graph, split_name, min_trades in tasks
+    }
+    for fut in as_completed(fut_to_key):
+        key, metrics = fut.result()
+        results[key] = metrics
+        done += 1
+        on_done(done)
+    return results
+
+
 # ---- The runner ---------------------------------------------------------
 def run_sweep(
     data: pd.DataFrame,
@@ -188,13 +298,23 @@ def run_sweep(
     costs=None,
     seed: int = 42,
     progress_callback: Optional[Callable[[float, str], None]] = None,
+    n_jobs: Optional[int] = None,
 ) -> SweepResult:
     """
     Run the full 3-stage sweep.
 
     `progress_callback(fraction, message)`: called periodically with
     progress in [0, 1] and a short status message. Use this to drive a
-    Streamlit progress bar.
+    Streamlit progress bar. When running in parallel the callback fires as
+    trials COMPLETE (not as they're submitted), so the bar reflects real
+    work done.
+
+    `n_jobs` controls trial parallelism:
+      - None (default): auto-detect → `os.cpu_count() - 1` workers, leaving
+        one core for the OS.
+      - 1: run serially in-process (the reference path; no pool overhead).
+      - N > 1: fan trials out across a `ProcessPoolExecutor` of N workers.
+    Results are bit-identical across `n_jobs` values for the same seed.
 
     Stage 1 takes ~half the time (N trials × IS), stage 2 a small slice
     (top_k × Val), stage 3 a smaller slice (top_m × OOS). The callback
@@ -205,6 +325,8 @@ def run_sweep(
         top_k = n_trials
     if top_m > top_k:
         top_m = top_k
+
+    n_jobs = _resolve_n_jobs(n_jobs)
 
     split = three_way_split(data, is_ratio, val_ratio)
     rng = np.random.default_rng(seed)
@@ -222,53 +344,98 @@ def run_sweep(
     # Total notional work = n_trials (IS) + top_k (Val) + top_m (OOS).
     # We allocate progress weights so the bar moves linearly with work done.
     total_work = n_trials + top_k + top_m
+    starting_balance = 10_000.0  # display only; broker uses its own
 
-    def _report(work_done: int, message: str):
-        if progress_callback:
-            progress_callback(work_done / total_work, message)
+    # Per-worker context (read-only). Keyed by split name so a single pool
+    # can serve all three stages without re-shipping the data.
+    splits = {"is": split.is_df, "val": split.val_df, "oos": split.oos_df}
 
-    # ---- Stage 1: IS sweep ----
-    _log.info("Stage 1: IS sweep, %d trials", n_trials)
-    is_trials: list[TrialResult] = []
-    for i in range(n_trials):
-        g = sample_random_graph(space, rng)
-        m = _run_one_trial(
-            g, split.is_df, costs,
-            starting_balance=10_000.0,  # display only; broker uses its own
-            min_trades=is_min_trades,
-            warmup_bars=warmup_bars,
+    def _stage_reporter(stage_name: str, stage_total: int, base_done: int):
+        """Build an `on_done(n)` callback that maps stage progress onto the
+        global [0, 1] budget. `base_done` is the work already finished in
+        earlier stages so the bar never goes backwards."""
+        def _on_done(done_in_stage: int):
+            if progress_callback:
+                frac = (base_done + done_in_stage) / total_work
+                progress_callback(frac, f"{stage_name} {done_in_stage}/{stage_total}")
+        return _on_done
+
+    # ---- Pre-generate ALL N graphs serially (determinism) ----
+    # Sampling consumes the RNG in a strict order; do it on the main thread
+    # so identical seeds give identical graphs regardless of n_jobs.
+    graphs = [sample_random_graph(space, rng) for _ in range(n_trials)]
+
+    executor = None
+    if n_jobs > 1:
+        _log.info("Sweep running on %d worker processes", n_jobs)
+        executor = ProcessPoolExecutor(
+            max_workers=n_jobs,
+            initializer=_pool_init,
+            initargs=(splits, costs, starting_balance, warmup_bars),
         )
-        is_trials.append(TrialResult(trial_index=i, graph=g, metrics=m))
-        _report(i + 1, f"IS trial {i + 1}/{n_trials}")
-    is_trials.sort(key=lambda t: t.metrics.sharpe, reverse=True)
+    else:
+        _log.info("Sweep running serially (n_jobs=1)")
 
-    # ---- Stage 2: Val rerank of top-K ----
-    _log.info("Stage 2: Val rerank, top %d", top_k)
-    val_top: list[TrialResult] = []
-    for j, src in enumerate(is_trials[:top_k]):
-        m = _run_one_trial(
-            src.graph, split.val_df, costs,
-            starting_balance=10_000.0,
-            min_trades=val_min_trades,
-            warmup_bars=warmup_bars,
+    try:
+        # ---- Stage 1: IS sweep ----
+        _log.info("Stage 1: IS sweep, %d trials", n_trials)
+        is_tasks = [
+            (i, graphs[i], "is", is_min_trades) for i in range(n_trials)
+        ]
+        is_metrics = _execute_stage(
+            is_tasks, splits, costs, starting_balance, warmup_bars, executor,
+            _stage_reporter("IS trial", n_trials, 0),
         )
-        val_top.append(TrialResult(trial_index=src.trial_index, graph=src.graph, metrics=m))
-        _report(n_trials + j + 1, f"Val trial {j + 1}/{top_k}")
-    val_top.sort(key=lambda t: t.metrics.sharpe, reverse=True)
+        is_trials = [
+            TrialResult(trial_index=i, graph=graphs[i], metrics=is_metrics[i])
+            for i in range(n_trials)
+        ]
+        is_trials.sort(key=lambda t: t.metrics.sharpe, reverse=True)
 
-    # ---- Stage 3: OOS report on top-M ----
-    _log.info("Stage 3: OOS report, top %d", top_m)
-    oos_top: list[TrialResult] = []
-    for k, src in enumerate(val_top[:top_m]):
-        m = _run_one_trial(
-            src.graph, split.oos_df, costs,
-            starting_balance=10_000.0,
-            min_trades=oos_min_trades,
-            warmup_bars=warmup_bars,
+        # ---- Stage 2: Val rerank of top-K ----
+        _log.info("Stage 2: Val rerank, top %d", top_k)
+        val_sources = is_trials[:top_k]
+        val_tasks = [
+            (j, val_sources[j].graph, "val", val_min_trades)
+            for j in range(len(val_sources))
+        ]
+        val_metrics = _execute_stage(
+            val_tasks, splits, costs, starting_balance, warmup_bars, executor,
+            _stage_reporter("Val trial", top_k, n_trials),
         )
-        oos_top.append(TrialResult(trial_index=src.trial_index, graph=src.graph, metrics=m))
-        _report(n_trials + top_k + k + 1, f"OOS trial {k + 1}/{top_m}")
-    oos_top.sort(key=lambda t: t.metrics.sharpe, reverse=True)
+        val_top = [
+            TrialResult(
+                trial_index=val_sources[j].trial_index,
+                graph=val_sources[j].graph,
+                metrics=val_metrics[j],
+            )
+            for j in range(len(val_sources))
+        ]
+        val_top.sort(key=lambda t: t.metrics.sharpe, reverse=True)
+
+        # ---- Stage 3: OOS report on top-M ----
+        _log.info("Stage 3: OOS report, top %d", top_m)
+        oos_sources = val_top[:top_m]
+        oos_tasks = [
+            (k, oos_sources[k].graph, "oos", oos_min_trades)
+            for k in range(len(oos_sources))
+        ]
+        oos_metrics = _execute_stage(
+            oos_tasks, splits, costs, starting_balance, warmup_bars, executor,
+            _stage_reporter("OOS trial", top_m, n_trials + top_k),
+        )
+        oos_top = [
+            TrialResult(
+                trial_index=oos_sources[k].trial_index,
+                graph=oos_sources[k].graph,
+                metrics=oos_metrics[k],
+            )
+            for k in range(len(oos_sources))
+        ]
+        oos_top.sort(key=lambda t: t.metrics.sharpe, reverse=True)
+    finally:
+        if executor is not None:
+            executor.shutdown()
 
     return SweepResult(
         is_trials=is_trials,

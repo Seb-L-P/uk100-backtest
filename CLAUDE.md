@@ -87,6 +87,7 @@ uk100-backtest/
 │   ├── sweep_space.py           # SearchSpace + sample_random_graph()
 │   ├── sweep_objective.py       # Sharpe with adaptive min-trades floor
 │   ├── sweep_runner.py          # 3-stage sweep orchestrator
+│   │                            #   (parallel via ProcessPoolExecutor, n_jobs)
 │   │
 │   │   --- Validation / refinement (Phase 4) ---
 │   ├── sweep_persistence.py     # save/load top candidates as JSON
@@ -268,6 +269,21 @@ which executes the 3-stage IS→Val→OOS flow:
   max(3, n_bars // 80))`, so smaller Val/OOS windows don't
   over-disqualify. Returns a `SweepResult` with all three tiers + the
   adaptive floors actually used.
+  **Parallel execution** (`n_jobs` param): each stage is embarrassingly
+  parallel — a trial is a pure function of (graph, split, costs). All N
+  graphs are sampled SERIALLY up front (graph sampling consumes the RNG in
+  strict order — that's the only way identical seeds give identical graphs),
+  then the backtests fan out over a `ProcessPoolExecutor`. `n_jobs=None`
+  (default) → `os.cpu_count()-1` workers; `n_jobs=1` → in-process serial
+  (reference path, no pool overhead); `n_jobs>1` → that many workers. The
+  read-only split DataFrames + cost model are shipped to each worker ONCE
+  via the pool `initializer` (per-process global), not re-pickled per task.
+  Results are reassembled in trial order before sorting, so the final
+  leaderboard is **bit-identical across `n_jobs` for the same seed**.
+  `progress_callback` fires as trials COMPLETE (`as_completed`), not as
+  they're submitted. Per-trial crashes are still caught inside the worker
+  (`_run_one_trial` never raises). `run_multi_seed` forwards `n_jobs`, so
+  multi-seed runs parallelise within each seed (seeds run sequentially).
 
 ### Backward-compat alias
 
@@ -412,8 +428,12 @@ What IS modelled:
   skip entries within ±30 min. Would improve cost realism further.
 - **Empirical slippage calibration** — once paper trading runs, compare
   live fills to backtest predictions, update `slip_spread_multiplier`.
-- **Parallel sweeps** — would 4× discovery throughput on a Mac. Requires
-  picklable graph orchestrators; currently runs serial.
+- **Parallel sweeps** — ✅ DONE. `run_sweep(..., n_jobs=...)` fans trials
+  out over a `ProcessPoolExecutor` (default `os.cpu_count()-1` workers).
+  The picklable unit is the `DecisionGraph` (a plain dataclass), not the
+  orchestrator — workers build their own `GraphOrchestrator` from it.
+  Determinism preserved by sampling all graphs serially up front. See the
+  sweep_runner bullet above.
 
 ---
 
@@ -430,6 +450,7 @@ The backtester is honest about:
 - Leverage-cap rejection at FILL time (not just signal time)
 - Stale signal handling (close/scale_out on already-closed positions)
 - Multi-seed robustness (run discovery sweep under N seeds, aggregate)
+- Parallel sweeps (ProcessPoolExecutor, deterministic across `n_jobs`)
 
 Remaining gaps are mostly inherent to bar-resolution data + retail data
 feeds. No more backtester polish will close them without tick-level data.
